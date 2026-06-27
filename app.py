@@ -28,8 +28,13 @@ for col in ["Início Contrato", "Aluguel Devido"]:
 # ==========================================
 # TRATAMENTO DE TIPOS DE DADOS E CORREÇÃO DE ERROS
 # ==========================================
+# Força a coluna 'Loja' na aba Lojas a ser texto puro
 if 'Loja' in df_lojas.columns:
     df_lojas['Loja'] = df_lojas['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
+
+# Força a coluna 'Loja' na aba Pagamentos a ser texto puro (Isso resolve o ValueError no merge)
+if 'Loja' in df_pagamentos.columns:
+    df_pagamentos['Loja'] = df_pagamentos['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
 df_lojas['Início Contrato'] = df_lojas['Início Contrato'].astype('object')
 
@@ -122,6 +127,7 @@ with tab2:
         # Agrupa somando os Valores Pagos e o IPTU do mês
         pagamentos_agrupados = df_mes.groupby("Loja")[["Valor Pago", "IPTU"]].sum().reset_index()
         
+        # Agora o merge vai funcionar porque 'Loja' é texto nas duas planilhas
         df_resumo = pd.merge(df_lojas, pagamentos_agrupados, on="Loja", how="left")
         
         # Tratamento de nulos
