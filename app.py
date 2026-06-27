@@ -4,6 +4,17 @@ from streamlit_gsheets import GSheetsConnection
 from datetime import date
 
 st.set_page_config(page_title="Controle de Inquilinos", layout="wide")
+
+# ==========================================
+# BARRA LATERAL (SINCRONIZAÇÃO MANUAL)
+# ==========================================
+st.sidebar.title("⚙️ Sistema")
+if st.sidebar.button("🔄 Sincronizar com Sheets", use_container_width=True):
+    # Limpa o cache para forçar a leitura de dados novos do Google Sheets
+    st.cache_data.clear()
+    st.rerun()
+st.sidebar.info("Dica: Clique no botão acima sempre que você preencher ou alterar dados diretamente pelo Google Sheets.")
+
 st.title("🏢 Controle de Aluguéis")
 
 # Função auxiliar para formatar valores no padrão de moeda brasileiro
@@ -28,17 +39,15 @@ for col in ["Responsável", "Início Contrato", "Aluguel Devido"]:
 # ==========================================
 # TRATAMENTO DE TIPOS DE DADOS E CORREÇÃO DE ERROS
 # ==========================================
-# Força a coluna 'Loja' na aba Lojas a ser texto puro
 if 'Loja' in df_lojas.columns:
     df_lojas['Loja'] = df_lojas['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
-# Força a coluna 'Loja' na aba Pagamentos a ser texto puro (Resolve ValueError no merge)
 if 'Loja' in df_pagamentos.columns:
     df_pagamentos['Loja'] = df_pagamentos['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
 df_lojas['Início Contrato'] = df_lojas['Início Contrato'].astype('object')
 
-# Garantir que colunas financeiras (incluindo IPTU) existam no df_pagamentos
+# Garantir que colunas financeiras (incluindo IPTU e Valor Aluguel) existam no df_pagamentos
 for col in ["Valor Aluguel", "IPTU", "Valor Pago", "R$Diferença"]:
     if col not in df_pagamentos.columns:
         df_pagamentos[col] = 0.0
@@ -52,11 +61,9 @@ tab1, tab2, tab3 = st.tabs(["📝 Lançar Pagamento", "📊 Visão Geral", "🔄
 with tab1:
     st.header("Novo Lançamento")
     
-    # Seleção da Loja 
     lista_lojas = df_lojas['Loja'].dropna().tolist()
     loja_selecionada = st.selectbox("Selecione a Loja", lista_lojas, key="loja_pag")
     
-    # Buscando o "Aluguel Devido" atual na base cadastral
     try:
         linha_loja = df_lojas[df_lojas['Loja'] == loja_selecionada]
         aluguel_devido_atual = pd.to_numeric(linha_loja['Aluguel Devido'], errors='coerce').fillna(0).values[0]
@@ -70,7 +77,7 @@ with tab1:
         
         with col1:
             data_pagamento = st.date_input("Data do Pagamento", date.today(), format="DD/MM/YYYY")
-            valor_iptu = st.number_input("Taxa de IPTU (R$)", min_value=0.0, value=0.0, step=50.0, help="Preencha apenas quando houver cobrança de IPTU.")
+            valor_iptu = st.number_input("Taxa de IPTU (R$)", min_value=0.0, value=0.0, step=50.0)
             
         with col2:
             valor_pago = st.number_input("Valor Total Pago (R$)", min_value=0.0, step=50.0)
@@ -91,8 +98,14 @@ with tab1:
                 "R$Diferença": diferenca
             }])
             
+            # Garante que a ordem das colunas ao salvar seja exatamente a mesma da planilha atual
+            novo_lancamento = novo_lancamento.reindex(columns=df_pagamentos.columns)
+            
             df_atualizado = pd.concat([df_pagamentos, novo_lancamento], ignore_index=True)
             conn.update(worksheet="Pagamentos", data=df_atualizado)
+            
+            # Força a limpeza de cache após salvar via sistema
+            st.cache_data.clear()
             
             if diferenca > 0:
                 st.warning(f"Pagamento parcial registrado! Restou uma diferença de {formatar_brl(diferenca)} neste lançamento.")
@@ -102,7 +115,7 @@ with tab1:
             st.rerun()
 
 # ==========================================
-# ABA 2: Visão Geral
+# ABA 2: Visão Geral (DASHBOARD INTELIGENTE)
 # ==========================================
 with tab2:
     st.header("Status dos Aluguéis")
@@ -117,7 +130,6 @@ with tab2:
         if not meses_disponiveis:
             meses_disponiveis = [date.today().strftime('%m/%Y')]
             
-        # Filtros Lado a Lado (Mês e Loja)
         col_filtro1, col_filtro2 = st.columns(2)
         with col_filtro1:
             mes_analise = st.selectbox("Selecione o Mês do Pagamento", meses_disponiveis)
@@ -126,19 +138,33 @@ with tab2:
             loja_filtro = st.selectbox("Filtrar por Loja", opcoes_loja)
         
         df_mes = df_pagamentos[df_pagamentos["Mês/Ano"] == mes_analise]
-        pagamentos_agrupados = df_mes.groupby("Loja")[["Valor Pago", "IPTU"]].sum().reset_index()
+        
+        # O SEGREDRO: Agora agrupamos e buscamos o 'Valor Aluguel' do histórico, não apenas os pagamentos
+        pagamentos_agrupados = df_mes.groupby("Loja").agg({
+            "Valor Pago": "sum",
+            "IPTU": "sum",
+            "Valor Aluguel": "max" # Pega o valor da época do contrato salvo no Pagamento
+        }).reset_index()
         
         df_resumo = pd.merge(df_lojas, pagamentos_agrupados, on="Loja", how="left")
         
-        for col in ["Valor Pago", "IPTU", "Aluguel Devido"]:
-            df_resumo[col] = pd.to_numeric(df_resumo[col], errors='coerce').fillna(0)
+        # Tratamento financeiro isolado para não conflitar com nulos
+        df_resumo["Valor Pago"] = pd.to_numeric(df_resumo["Valor Pago"], errors='coerce').fillna(0)
+        df_resumo["IPTU"] = pd.to_numeric(df_resumo["IPTU"], errors='coerce').fillna(0)
+        df_resumo["Aluguel Devido Atual"] = pd.to_numeric(df_resumo["Aluguel Devido"], errors='coerce').fillna(0)
+        df_resumo["Valor Aluguel Histórico"] = pd.to_numeric(df_resumo["Valor Aluguel"], errors='coerce')
+        
+        # BI Lógica: Se o inquilino pagou no mês, usa o valor histórico do aluguel. Se não pagou nada, projeta o aluguel atual.
+        df_resumo["Aluguel Considerado"] = df_resumo["Valor Aluguel Histórico"].fillna(df_resumo["Aluguel Devido Atual"])
             
-        df_resumo["Total Esperado"] = df_resumo["Aluguel Devido"] + df_resumo["IPTU"]
+        df_resumo["Total Esperado"] = df_resumo["Aluguel Considerado"] + df_resumo["IPTU"]
         df_resumo["Valor Devedor"] = df_resumo["Total Esperado"] - df_resumo["Valor Pago"]
         
-        df_display = df_resumo[["Loja", "Responsável", "Aluguel Devido", "IPTU", "Total Esperado", "Valor Pago", "Valor Devedor"]].copy()
+        df_display = df_resumo[["Loja", "Responsável", "Aluguel Considerado", "IPTU", "Total Esperado", "Valor Pago", "Valor Devedor"]].copy()
         
-        # Aplicação do Filtro de Loja
+        # Renomeia para exibição limpa
+        df_display.rename(columns={"Aluguel Considerado": "Aluguel Devido"}, inplace=True)
+        
         if loja_filtro != "Todas":
             df_display = df_display[df_display["Loja"] == loja_filtro]
         
@@ -146,7 +172,7 @@ with tab2:
         total_recebido_geral = df_display["Valor Pago"].sum()
         total_pendente_geral = df_display["Valor Devedor"].sum()
         
-        st.write("") # Espaçamento
+        st.write("")
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Esperado", formatar_brl(total_esperado_geral))
@@ -180,13 +206,11 @@ with tab3:
     st.write("Atualize os dados do inquilino ou ajuste o valor base do aluguel.")
 
     with st.form("form_reajuste", clear_on_submit=True):
-        
         col1, col2 = st.columns(2)
         
         with col1:
             loja_reajuste = st.selectbox("Selecione a Loja", df_lojas['Loja'].dropna().tolist(), key="loja_reajuste")
         
-        # Puxar dados atuais para preencher os campos previamente
         try:
             dados_loja = df_lojas[df_lojas['Loja'] == loja_reajuste].iloc[0]
             valor_atual = float(pd.to_numeric(dados_loja.get('Aluguel Devido', 0), errors='coerce'))
@@ -214,6 +238,9 @@ with tab3:
             df_lojas.at[idx, 'Início Contrato'] = data_ajuste.strftime("%d/%m/%Y")
             
             conn.update(worksheet="Lojas", data=df_lojas)
+            
+            # Limpa o cache após atualizar via sistema
+            st.cache_data.clear()
             
             st.success(f"Cadastro da {loja_reajuste} atualizado com sucesso!")
             st.rerun()
