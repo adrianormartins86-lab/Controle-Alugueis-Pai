@@ -20,8 +20,8 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 df_lojas = conn.read(worksheet="Lojas", ttl=0).dropna(how="all")
 df_pagamentos = conn.read(worksheet="Pagamentos", ttl=0).dropna(how="all")
 
-# Garantir que colunas de contrato existam no df_lojas
-for col in ["Início Contrato", "Prazo Anos", "Mês Reajuste", "Aluguel Devido"]:
+# Garantir que apenas as colunas essenciais de contrato existam no df_lojas
+for col in ["Início Contrato", "Aluguel Devido"]:
     if col not in df_lojas.columns:
         df_lojas[col] = ""
 
@@ -32,9 +32,8 @@ for col in ["Início Contrato", "Prazo Anos", "Mês Reajuste", "Aluguel Devido"]
 if 'Loja' in df_lojas.columns:
     df_lojas['Loja'] = df_lojas['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
-# 2. Força colunas de texto/data vazias a aceitarem Strings para evitar o TypeError no salvamento
+# 2. Força coluna de data vazia a aceitar Strings para evitar o TypeError
 df_lojas['Início Contrato'] = df_lojas['Início Contrato'].astype('object')
-df_lojas['Mês Reajuste'] = df_lojas['Mês Reajuste'].astype('object')
 
 # Garantir que colunas financeiras existam no df_pagamentos
 for col in ["Valor Aluguel", "Valor Pago", "R$Diferença"]:
@@ -50,7 +49,7 @@ tab1, tab2, tab3 = st.tabs(["📝 Lançar Pagamento", "📊 Visão Geral", "🔄
 with tab1:
     st.header("Novo Lançamento")
     
-    # Seleção da Loja (fora do formulário para permitir a atualização reativa na tela)
+    # Seleção da Loja 
     lista_lojas = df_lojas['Loja'].dropna().tolist()
     loja_selecionada = st.selectbox("Selecione a Loja", lista_lojas, key="loja_pag")
     
@@ -61,14 +60,12 @@ with tab1:
     except:
         aluguel_devido_atual = 0.0
 
-    # Exibe na interface o valor esperado formatado com vírgula
     st.info(f"💰 **Valor do Aluguel Cadastrado para a {loja_selecionada}:** {formatar_brl(aluguel_devido_atual)}")
     
     with st.form("form_pagamento", clear_on_submit=True):
         col1, col2 = st.columns(2)
         
         with col1:
-            # Data de entrada configurada no formato brasileiro
             data_pagamento = st.date_input("Data do Pagamento", date.today(), format="DD/MM/YYYY")
             mes_referencia = st.selectbox("Mês de Referência", 
                                           ["01/2026", "02/2026", "03/2026", "04/2026", 
@@ -126,7 +123,6 @@ with tab2:
         total_recebido = df_display["Valor Pago"].sum()
         total_pendente = df_display["Valor Devedor"].sum()
         
-        # Métricas exibidas no formato de moeda local
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Esperado no Mês", formatar_brl(total_esperado))
         col2.metric("Total Recebido no Mês", formatar_brl(total_recebido))
@@ -139,7 +135,6 @@ with tab2:
                 return ['background-color: #ffcccc'] * len(row)
             return ['background-color: #ccffcc'] * len(row)
             
-        # Aplicação de estilo na tabela para formatar as moedas com vírgula sem quebrar a lógica matemática
         df_estilizado = df_display.style.format({
             "Aluguel Devido": formatar_brl,
             "Valor Pago": formatar_brl,
@@ -155,27 +150,28 @@ with tab2:
 # ==========================================
 with tab3:
     st.header("Atualizar Contratos e Reajustar Aluguel")
-    st.write("Ajuste manualmente o valor base do aluguel sempre que houver necessidade.")
+    st.write("Ajuste o valor base do aluguel. O novo valor será automaticamente puxado nos próximos lançamentos.")
 
     with st.form("form_reajuste", clear_on_submit=True):
-        loja_reajuste = st.selectbox("Selecione a Loja", df_lojas['Loja'].dropna().tolist(), key="loja_reajuste")
         
+        # Tudo em uma única linha estruturada
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            loja_reajuste = st.selectbox("Selecione a Loja", df_lojas['Loja'].dropna().tolist(), key="loja_reajuste")
+        
+        # Puxar dados atuais para exibir no input
         try:
             dados_loja = df_lojas[df_lojas['Loja'] == loja_reajuste].iloc[0]
             valor_atual = float(pd.to_numeric(dados_loja.get('Aluguel Devido', 0), errors='coerce'))
         except:
             valor_atual = 0.0
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            novo_valor = st.number_input("Novo Valor do Aluguel (R$)", value=valor_atual, step=50.0)
-            mes_reajuste = st.selectbox("Mês Base de Reajuste", 
-                                        ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", 
-                                         "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"])
+            
         with col2:
-            # Entrada de data configurada no formato nacional brasileiro
-            inicio_contrato = st.date_input("Data de Início do Contrato", format="DD/MM/YYYY")
-            prazo_anos = st.number_input("Duração do Contrato (Anos)", min_value=1, value=1)
+            data_ajuste = st.date_input("Data do Contrato / Ajuste", format="DD/MM/YYYY")
+            
+        with col3:
+            novo_valor = st.number_input("Novo Valor (R$)", value=valor_atual, step=50.0)
             
         submit_reajuste = st.form_submit_button("Salvar Atualização")
         
@@ -183,9 +179,7 @@ with tab3:
             idx = df_lojas.index[df_lojas['Loja'] == loja_reajuste].tolist()[0]
             
             df_lojas.at[idx, 'Aluguel Devido'] = novo_valor
-            df_lojas.at[idx, 'Início Contrato'] = inicio_contrato.strftime("%d/%m/%Y")
-            df_lojas.at[idx, 'Prazo Anos'] = prazo_anos
-            df_lojas.at[idx, 'Mês Reajuste'] = mes_reajuste
+            df_lojas.at[idx, 'Início Contrato'] = data_ajuste.strftime("%d/%m/%Y")
             
             conn.update(worksheet="Lojas", data=df_lojas)
             
@@ -194,7 +188,10 @@ with tab3:
             
     st.subheader("Dados Atuais dos Contratos")
     
-    df_lojas_display = df_lojas.copy()
+    # Filtra o DataFrame para exibir apenas as colunas que importam agora, ignorando sobras na planilha
+    colunas_exibicao = [col for col in ['Loja', 'Responsável', 'Aluguel Devido', 'Início Contrato'] if col in df_lojas.columns]
+    df_lojas_display = df_lojas[colunas_exibicao].copy()
+    
     if 'Aluguel Devido' in df_lojas_display.columns:
         df_lojas_display['Aluguel Devido'] = pd.to_numeric(df_lojas_display['Aluguel Devido'], errors='coerce').fillna(0)
     
