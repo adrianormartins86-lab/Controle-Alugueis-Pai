@@ -21,7 +21,7 @@ df_lojas = conn.read(worksheet="Lojas", ttl=0).dropna(how="all")
 df_pagamentos = conn.read(worksheet="Pagamentos", ttl=0).dropna(how="all")
 
 # Garantir que apenas as colunas essenciais de contrato existam no df_lojas
-for col in ["Início Contrato", "Aluguel Devido"]:
+for col in ["Responsável", "Início Contrato", "Aluguel Devido"]:
     if col not in df_lojas.columns:
         df_lojas[col] = ""
 
@@ -32,7 +32,7 @@ for col in ["Início Contrato", "Aluguel Devido"]:
 if 'Loja' in df_lojas.columns:
     df_lojas['Loja'] = df_lojas['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
-# Força a coluna 'Loja' na aba Pagamentos a ser texto puro (Isso resolve o ValueError no merge)
+# Força a coluna 'Loja' na aba Pagamentos a ser texto puro (Resolve ValueError no merge)
 if 'Loja' in df_pagamentos.columns:
     df_pagamentos['Loja'] = df_pagamentos['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
@@ -74,12 +74,11 @@ with tab1:
             
         with col2:
             valor_pago = st.number_input("Valor Total Pago (R$)", min_value=0.0, step=50.0)
-            st.write("") # Espaçamento
-            st.write("") # Espaçamento
+            st.write("") 
+            st.write("") 
             submit = st.form_submit_button("Registrar Pagamento", use_container_width=True)
         
         if submit:
-            # A diferença agora considera o Aluguel base + IPTU
             total_esperado = aluguel_devido_atual + valor_iptu
             diferenca = total_esperado - valor_pago
             
@@ -109,45 +108,50 @@ with tab2:
     st.header("Status dos Aluguéis")
     
     if not df_pagamentos.empty:
-        # BI Inteligente: Extraindo o Mês/Ano automaticamente das datas de pagamento para gerar os filtros
         df_pagamentos['Data_Temp'] = pd.to_datetime(df_pagamentos['Data Pagamento'], format='%d/%m/%Y', errors='coerce')
         df_pagamentos['Mês/Ano'] = df_pagamentos['Data_Temp'].dt.strftime('%m/%Y')
         
         meses_disponiveis = df_pagamentos['Mês/Ano'].dropna().unique().tolist()
-        meses_disponiveis.sort(reverse=True) # Ordena do mais recente para o mais antigo
+        meses_disponiveis.sort(reverse=True) 
         
         if not meses_disponiveis:
             meses_disponiveis = [date.today().strftime('%m/%Y')]
             
-        mes_analise = st.selectbox("Selecione o Mês do Pagamento", meses_disponiveis)
+        # Filtros Lado a Lado (Mês e Loja)
+        col_filtro1, col_filtro2 = st.columns(2)
+        with col_filtro1:
+            mes_analise = st.selectbox("Selecione o Mês do Pagamento", meses_disponiveis)
+        with col_filtro2:
+            opcoes_loja = ["Todas"] + df_lojas['Loja'].dropna().tolist()
+            loja_filtro = st.selectbox("Filtrar por Loja", opcoes_loja)
         
-        # Filtra pelo mês selecionado
         df_mes = df_pagamentos[df_pagamentos["Mês/Ano"] == mes_analise]
-        
-        # Agrupa somando os Valores Pagos e o IPTU do mês
         pagamentos_agrupados = df_mes.groupby("Loja")[["Valor Pago", "IPTU"]].sum().reset_index()
         
-        # Agora o merge vai funcionar porque 'Loja' é texto nas duas planilhas
         df_resumo = pd.merge(df_lojas, pagamentos_agrupados, on="Loja", how="left")
         
-        # Tratamento de nulos
         for col in ["Valor Pago", "IPTU", "Aluguel Devido"]:
             df_resumo[col] = pd.to_numeric(df_resumo[col], errors='coerce').fillna(0)
             
-        # Calcula o saldo devedor incluindo o IPTU na conta
         df_resumo["Total Esperado"] = df_resumo["Aluguel Devido"] + df_resumo["IPTU"]
         df_resumo["Valor Devedor"] = df_resumo["Total Esperado"] - df_resumo["Valor Pago"]
         
         df_display = df_resumo[["Loja", "Responsável", "Aluguel Devido", "IPTU", "Total Esperado", "Valor Pago", "Valor Devedor"]].copy()
         
+        # Aplicação do Filtro de Loja
+        if loja_filtro != "Todas":
+            df_display = df_display[df_display["Loja"] == loja_filtro]
+        
         total_esperado_geral = df_display["Total Esperado"].sum()
         total_recebido_geral = df_display["Valor Pago"].sum()
         total_pendente_geral = df_display["Valor Devedor"].sum()
         
+        st.write("") # Espaçamento
+        
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Esperado no Mês", formatar_brl(total_esperado_geral))
-        col2.metric("Total Recebido no Mês", formatar_brl(total_recebido_geral))
-        col3.metric("Pendente Geral (Devedor)", formatar_brl(total_pendente_geral))
+        col1.metric("Total Esperado", formatar_brl(total_esperado_geral))
+        col2.metric("Total Recebido", formatar_brl(total_recebido_geral))
+        col3.metric("Pendente (Devedor/Crédito)", formatar_brl(total_pendente_geral))
         
         st.divider()
         
@@ -173,37 +177,45 @@ with tab2:
 # ==========================================
 with tab3:
     st.header("Atualizar Contratos e Reajustar Aluguel")
-    st.write("Ajuste o valor base do aluguel. O novo valor será automaticamente puxado nos próximos lançamentos.")
+    st.write("Atualize os dados do inquilino ou ajuste o valor base do aluguel.")
 
     with st.form("form_reajuste", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
+        
+        col1, col2 = st.columns(2)
         
         with col1:
             loja_reajuste = st.selectbox("Selecione a Loja", df_lojas['Loja'].dropna().tolist(), key="loja_reajuste")
         
+        # Puxar dados atuais para preencher os campos previamente
         try:
             dados_loja = df_lojas[df_lojas['Loja'] == loja_reajuste].iloc[0]
             valor_atual = float(pd.to_numeric(dados_loja.get('Aluguel Devido', 0), errors='coerce'))
+            responsavel_atual = str(dados_loja.get('Responsável', ''))
+            if responsavel_atual.lower() == 'nan': 
+                responsavel_atual = ""
         except:
             valor_atual = 0.0
+            responsavel_atual = ""
+            
+        with col1:
+            novo_responsavel = st.text_input("Responsável (Inquilino)", value=responsavel_atual)
             
         with col2:
             data_ajuste = st.date_input("Data do Contrato / Ajuste", format="DD/MM/YYYY")
-            
-        with col3:
             novo_valor = st.number_input("Novo Valor (R$)", value=valor_atual, step=50.0)
             
-        submit_reajuste = st.form_submit_button("Salvar Atualização")
+        submit_reajuste = st.form_submit_button("Salvar Atualizações", use_container_width=True)
         
         if submit_reajuste:
             idx = df_lojas.index[df_lojas['Loja'] == loja_reajuste].tolist()[0]
             
+            df_lojas.at[idx, 'Responsável'] = novo_responsavel
             df_lojas.at[idx, 'Aluguel Devido'] = novo_valor
             df_lojas.at[idx, 'Início Contrato'] = data_ajuste.strftime("%d/%m/%Y")
             
             conn.update(worksheet="Lojas", data=df_lojas)
             
-            st.success(f"Contrato da {loja_reajuste} atualizado com sucesso! Novo aluguel: {formatar_brl(novo_valor)}")
+            st.success(f"Cadastro da {loja_reajuste} atualizado com sucesso!")
             st.rerun()
             
     st.subheader("Dados Atuais dos Contratos")
