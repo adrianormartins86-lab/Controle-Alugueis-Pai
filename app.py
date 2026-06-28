@@ -1,250 +1,166 @@
 """
-Gestão de Aluguéis — controle de recebimentos de imóveis locados.
+Gestão de Aluguéis — versão com Google Sheets como banco de dados.
 
-Stack: Streamlit + SQLAlchemy.
-- Roda localmente com SQLite (zero configuração).
-- Em produção (Streamlit Cloud), aponte para o Supabase/Postgres via st.secrets["db_url"].
+Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
+O app lê/escreve via gspread (conta de serviço). O saldo é calculado em Python,
+então a planilha guarda apenas os campos que o usuário digita.
 
-Modelo de saldo:
-    saldo do imóvel = saldo_inicial + Σ(cobranças) − Σ(recebimentos)
-    saldo > 0  => inquilino DEVE esse valor.
-    saldo < 0  => inquilino pagou a MAIOR (crédito a favor dele).
+Configuração (Streamlit secrets):
+    app_password = "sua_senha"
+    sheet_key = "ID_DA_PLANILHA"          # parte do meio da URL da planilha
+    [gcp_service_account]                  # JSON da conta de serviço (campos a campo)
+    type = "service_account"
+    project_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "...@...iam.gserviceaccount.com"
+    ...
 """
 
 from __future__ import annotations
 import datetime as dt
-from contextlib import contextmanager
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import (create_engine, text, Column, Integer, String, Float,
-                        Boolean, Date, DateTime, ForeignKey)
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ----------------------------------------------------------------------------- #
-# Configuração de tipos de lançamento
+# Estrutura das abas
 # ----------------------------------------------------------------------------- #
-# Cada tipo tem uma "natureza": débito (cobrança) ou crédito (recebimento).
-TIPOS = {
-    "Aluguel do mês":          "debito",
-    "IPTU / Taxa de Lixo":     "debito",
-    "Multa / Juros":           "debito",
-    "Outras cobranças":        "debito",
-    "Pagamento recebido":      "credito",
-    "Pagamento em produtos":   "credito",
-    "Desconto / Abatimento":   "credito",
-}
-TIPOS_DEBITO = [t for t, n in TIPOS.items() if n == "debito"]
-TIPOS_CREDITO = [t for t, n in TIPOS.items() if n == "credito"]
+H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Início Contrato",
+           "Saldo Inicial", "Multa %", "Juros % a.m.", "Próximo Reajuste", "Observação"]
+H_PAG = ["Loja", "Competência", "Data Pagamento", "Aluguel Devido", "IPTU/Taxa",
+         "Multa/Juros", "Valor Pago", "Pago em Produtos", "Observação"]
+H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
+
+LOJAS_SEED = [
+    [1, "Produtos Naturais — Célia", 1100.00, 25, "", 4019.42, 2, 1, "25/06/2026",
+     "CONFIRMAR saldo (4.019,42): verificar se é dívida ou crédito."],
+    [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", 0, 2, 1, "25/05/2027",
+     "Sala relocada em 25/04/2026 (antes: Bruna)."],
+    [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", 1232.00, 2, 1, "01/08/2026",
+     "CONFIRMAR saldo (~980 + 252 multa). Refazer contrato 01/08/2026."],
+    [4, "Espetaria/Sorveteria — Rose Aguiar de Souza", 1270.30, 10, "", 0, 2, 1, "10/05/2027",
+     "Reajuste INCC 5,86% em 10/05/2026."],
+    [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", 0, 2, 1, "",
+     "Pagamentos em dia."],
+    [6, "Sala projetada (vaga)", 0, 1, "", 0, 2, 1, "", ""],
+    [7, "Apto. Florais — Allan e Amanda", 4000.00, 12, "", 0, 2, 1, "",
+     "CONFIRMAR: sem histórico na planilha."],
+]
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+
 
 # ----------------------------------------------------------------------------- #
-# Banco de dados (SQLAlchemy)
+# Conexão com o Google Sheets
 # ----------------------------------------------------------------------------- #
-Base = declarative_base()
-
-
-class Imovel(Base):
-    __tablename__ = "imoveis"
-    id = Column(Integer, primary_key=True)
-    nome = Column(String, nullable=False)
-    locatario = Column(String, default="")
-    telefone = Column(String, default="")
-    endereco = Column(String, default="")
-    valor_aluguel = Column(Float, default=0.0)
-    dia_vencimento = Column(Integer, default=1)
-    saldo_inicial = Column(Float, default=0.0)   # pendência herdada do controle antigo
-    multa_pct = Column(Float, default=2.0)       # % de multa por atraso (contrato)
-    juros_pct_mes = Column(Float, default=1.0)   # % de juros ao mês por atraso
-    ativo = Column(Boolean, default=True)
-    observacao = Column(String, default="")
-    lancamentos = relationship("Lancamento", back_populates="imovel",
-                               cascade="all, delete-orphan")
-
-
-class Lancamento(Base):
-    __tablename__ = "lancamentos"
-    id = Column(Integer, primary_key=True)
-    imovel_id = Column(Integer, ForeignKey("imoveis.id"), nullable=False)
-    data = Column(Date, nullable=False)
-    competencia = Column(String, default="")   # "AAAA-MM" do aluguel de referência
-    tipo = Column(String, nullable=False)
-    valor = Column(Float, nullable=False)
-    descricao = Column(String, default="")
-    criado_em = Column(DateTime, default=dt.datetime.now)
-    imovel = relationship("Imovel", back_populates="lancamentos")
-
-
 @st.cache_resource
-def get_engine():
-    """SQLite local por padrão; Postgres/Supabase se houver st.secrets['db_url']."""
-    url = None
-    try:
-        url = st.secrets.get("db_url")
-    except Exception:
-        url = None
-    if not url:
-        url = "sqlite:///alugueis.db"
-    engine = create_engine(url, pool_pre_ping=True)
-    Base.metadata.create_all(engine)
-    return engine
+def get_spreadsheet():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(st.secrets["sheet_key"])
+    garantir_estrutura(sh)
+    return sh
 
 
-SessionLocal = None
+def garantir_estrutura(sh):
+    """Cria as abas e cabeçalhos que faltarem; cadastra os 7 imóveis se vazio."""
+    titulos = {ws.title: ws for ws in sh.worksheets()}
+    def garante(nome, header, ncols):
+        if nome in titulos:
+            ws = titulos[nome]
+        else:
+            ws = sh.add_worksheet(title=nome, rows=500, cols=ncols)
+        atual = ws.row_values(1)
+        if atual[:len(header)] != header:
+            ws.update("A1", [header])
+        return ws
+    ws_lojas = garante("Lojas", H_LOJAS, len(H_LOJAS))
+    garante("Pagamentos", H_PAG, len(H_PAG))
+    garante("Reajustes", H_REAJ, len(H_REAJ))
+    # seed de Lojas se só tiver cabeçalho
+    if len(ws_lojas.get_all_values()) <= 1:
+        ws_lojas.update("A2", LOJAS_SEED, value_input_option="USER_ENTERED")
 
 
-@contextmanager
-def get_session():
-    global SessionLocal
-    if SessionLocal is None:
-        SessionLocal = sessionmaker(bind=get_engine())
-    s = SessionLocal()
-    try:
-        yield s
-        s.commit()
-    except Exception:
-        s.rollback()
-        raise
-    finally:
-        s.close()
+def ws(nome):
+    return get_spreadsheet().worksheet(nome)
+
+
+def ler(nome) -> pd.DataFrame:
+    return pd.DataFrame(ws(nome).get_all_records())
 
 
 # ----------------------------------------------------------------------------- #
-# Funções de domínio
+# Utilidades
 # ----------------------------------------------------------------------------- #
-def brl(v: float) -> str:
-    v = v or 0.0
+def brl(v) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        v = 0.0
     return ("R$ " + f"{v:,.2f}").replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def listar_imoveis(somente_ativos=False) -> pd.DataFrame:
-    with get_session() as s:
-        q = s.query(Imovel)
-        if somente_ativos:
-            q = q.filter(Imovel.ativo == True)  # noqa: E712
-        rows = [{
-            "id": i.id, "nome": i.nome, "locatario": i.locatario,
-            "telefone": i.telefone, "endereco": i.endereco,
-            "valor_aluguel": i.valor_aluguel, "dia_vencimento": i.dia_vencimento,
-            "saldo_inicial": i.saldo_inicial, "ativo": i.ativo,
-            "multa_pct": i.multa_pct, "juros_pct_mes": i.juros_pct_mes,
-            "observacao": i.observacao,
-        } for i in q.order_by(Imovel.nome).all()]
-    return pd.DataFrame(rows)
+def num(v) -> float:
+    """Converte célula (que pode vir como '1.100,00' ou 1100) em float."""
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace("R$", "").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
 
-def listar_lancamentos(imovel_id=None) -> pd.DataFrame:
-    with get_session() as s:
-        q = s.query(Lancamento)
-        if imovel_id:
-            q = q.filter(Lancamento.imovel_id == imovel_id)
-        rows = [{
-            "id": l.id, "imovel_id": l.imovel_id, "data": l.data,
-            "competencia": l.competencia, "tipo": l.tipo, "valor": l.valor,
-            "natureza": TIPOS.get(l.tipo, "debito"), "descricao": l.descricao,
-        } for l in q.order_by(Lancamento.data, Lancamento.id).all()]
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["data"] = pd.to_datetime(df["data"])
-    return df
-
-
-def saldo_imovel(imovel_id: int) -> float:
-    df = listar_lancamentos(imovel_id)
-    with get_session() as s:
-        imv = s.get(Imovel, imovel_id)
-        base = imv.saldo_inicial if imv else 0.0
-    if df.empty:
-        return base
-    deb = df.loc[df["natureza"] == "debito", "valor"].sum()
-    cre = df.loc[df["natureza"] == "credito", "valor"].sum()
-    return base + deb - cre
-
-
-def calcular_multa_juros(valor_base, dias_atraso, multa_pct, juros_pct_mes):
-    """Multa fixa (%) + juros pró-rata por dia de atraso. Retorna (multa, juros, total)."""
-    if dias_atraso <= 0 or valor_base <= 0:
-        return 0.0, 0.0, 0.0
-    multa = valor_base * (multa_pct / 100.0)
-    juros = valor_base * (juros_pct_mes / 100.0) * (dias_atraso / 30.0)
-    return round(multa, 2), round(juros, 2), round(multa + juros, 2)
-
-
-def add_imovel(**kw):
-    with get_session() as s:
-        s.add(Imovel(**kw))
-
-
-def update_imovel(imovel_id, **kw):
-    with get_session() as s:
-        imv = s.get(Imovel, imovel_id)
-        for k, v in kw.items():
-            setattr(imv, k, v)
-
-
-def del_imovel(imovel_id):
-    with get_session() as s:
-        s.delete(s.get(Imovel, imovel_id))
-
-
-def add_lancamento(**kw):
-    with get_session() as s:
-        s.add(Lancamento(**kw))
-
-
-def del_lancamento(lanc_id):
-    with get_session() as s:
-        s.delete(s.get(Lancamento, lanc_id))
-
-
-def seed_se_vazio():
-    """Cadastra os imóveis com os valores atuais lidos do controle original.
-
-    Os saldos abaixo foram extraídos da planilha em 28/06/2026. Os marcados com
-    'CONFIRMAR' vieram de uma leitura de células ambíguas — confira com seu pai
-    e ajuste na aba Imóveis (o campo de saldo é editável)."""
-    if not listar_imoveis().empty:
-        return
-    # nome, locatário, aluguel, dia_venc, saldo_inicial, observação
-    base = [
-        ("Loja 1 — Produtos Naturais", "Célia", 1100.00, 25, 4019.42,
-         "CONFIRMAR saldo: planilha mostra 4.019,42 — verificar se é dívida ou crédito."),
-        ("Loja 2 — Estética Facial", "Lorena Dias de Andrade", 1100.00, 25, 0.0,
-         "Sala relocada em 25/04/2026 (antes: Bruna). Pagou 2 aluguéis de calção."),
-        ("Loja 3 — Barbearia", "Douglas Vieira Alves", 980.00, 1, 1232.00,
-         "CONFIRMAR saldo: ~R$ 980 (jun/26) + R$ 252 multa/juros. Refazer contrato 01/08/2026."),
-        ("Loja 4 — Espetaria / Sorveteria", "Rose Aguiar de Souza", 1270.30, 10, 0.0,
-         "Aluguel reajustado (INCC) em 10/05/2026. Pagamentos antecipados."),
-        ("Loja 5 — Pizzaria KASS", "Jair Berbert de Souza", 2126.50, 30, 0.0,
-         "Pagamentos em dia."),
-        ("Loja 6 — Sala projetada (vaga)", "", 0.00, 1, 0.0, ""),
-        ("Apto. Florais", "Allan e Amanda", 4000.00, 12, 0.0,
-         "CONFIRMAR: sem histórico de pagamentos na planilha. IPTU anual por conta do locatário."),
-    ]
-    for nome, loc, val, dia, sini, obs in base:
-        add_imovel(nome=nome, locatario=loc, valor_aluguel=val,
-                   dia_vencimento=dia, ativo=bool(loc), saldo_inicial=sini,
-                   observacao=obs)
+def to_date(v):
+    if not v:
+        return None
+    return pd.to_datetime(v, dayfirst=True, errors="coerce")
 
 
 # ----------------------------------------------------------------------------- #
-# Autenticação simples (proteção da URL pública)
+# Cálculo de saldo (em Python)
+# ----------------------------------------------------------------------------- #
+def saldo_loja(loja_id, lojas: pd.DataFrame, pags: pd.DataFrame) -> float:
+    base = 0.0
+    linha = lojas[lojas["Loja"].astype(str) == str(loja_id)]
+    if not linha.empty:
+        base = num(linha.iloc[0]["Saldo Inicial"])
+    if pags.empty:
+        return base
+    p = pags[pags["Loja"].astype(str) == str(loja_id)]
+    cobr = sum(num(r["Aluguel Devido"]) + num(r["IPTU/Taxa"]) + num(r["Multa/Juros"])
+               for _, r in p.iterrows())
+    receb = sum(num(r["Valor Pago"]) + num(r["Pago em Produtos"])
+                for _, r in p.iterrows())
+    return base + cobr - receb
+
+
+# ----------------------------------------------------------------------------- #
+# Login
 # ----------------------------------------------------------------------------- #
 def checar_senha() -> bool:
-    try:
-        senha_correta = st.secrets.get("app_password", "1234")
-    except Exception:
-        senha_correta = "1234"
-    if st.session_state.get("autenticado"):
+    senha = st.secrets.get("app_password", "1234")
+    if st.session_state.get("ok"):
         return True
     st.markdown("### 🔐 Gestão de Aluguéis")
-    pwd = st.text_input("Senha de acesso", type="password")
+    pwd = st.text_input("Senha", type="password")
     if st.button("Entrar", type="primary"):
-        if pwd == senha_correta:
-            st.session_state["autenticado"] = True
+        if pwd == senha:
+            st.session_state["ok"] = True
             st.rerun()
         else:
             st.error("Senha incorreta.")
-    st.caption("Senha padrão: 1234 — troque em .streamlit/secrets.toml (app_password).")
     return False
 
 
@@ -253,309 +169,246 @@ def checar_senha() -> bool:
 # ----------------------------------------------------------------------------- #
 def pagina_dashboard():
     st.subheader("📊 Visão geral")
-    imoveis = listar_imoveis()
-    if imoveis.empty:
-        st.info("Cadastre seus imóveis na aba **Imóveis**.")
+    lojas, pags = ler("Lojas"), ler("Pagamentos")
+    if lojas.empty:
+        st.info("Cadastre imóveis na aba Imóveis.")
         return
 
     hoje = dt.date.today()
-    mes = st.selectbox(
-        "Mês de referência",
-        options=[(hoje.replace(day=1) - pd.DateOffset(months=k)).strftime("%Y-%m")
-                 for k in range(0, 12)],
-        index=0,
-    )
-    lanc = listar_lancamentos()
-
-    # Recebido no mês selecionado (créditos)
+    mes_atual = hoje.strftime("%Y-%m")
     recebido_mes = 0.0
-    if not lanc.empty:
-        m = lanc[(lanc["data"].dt.strftime("%Y-%m") == mes) &
-                 (lanc["natureza"] == "credito")]
-        recebido_mes = float(m["valor"].sum())
+    if not pags.empty:
+        for _, r in pags.iterrows():
+            d = to_date(r.get("Data Pagamento"))
+            if d is not None and not pd.isna(d) and d.strftime("%Y-%m") == mes_atual:
+                recebido_mes += num(r["Valor Pago"]) + num(r["Pago em Produtos"])
 
-    # Saldos por imóvel
-    saldos = {int(r.id): saldo_imovel(int(r.id)) for r in imoveis.itertuples()}
-    total_pendente = sum(v for v in saldos.values() if v > 0)
-    total_credito = -sum(v for v in saldos.values() if v < 0)
-    aluguel_esperado = float(imoveis.loc[imoveis["ativo"], "valor_aluguel"].sum())
+    saldos = {r["Loja"]: saldo_loja(r["Loja"], lojas, pags) for _, r in lojas.iterrows()}
+    total_pend = sum(v for v in saldos.values() if v > 0.005)
+    total_cred = -sum(v for v in saldos.values() if v < -0.005)
+    aluguel_esperado = sum(num(r["Aluguel Atual"]) for _, r in lojas.iterrows()
+                           if str(r["Responsável"]).strip())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Recebido no mês", brl(recebido_mes))
-    c2.metric("Aluguel esperado / mês", brl(aluguel_esperado))
-    c3.metric("Total pendente", brl(total_pendente))
-    c4.metric("Créditos a favor", brl(total_credito))
+    c2.metric("Aluguel esperado/mês", brl(aluguel_esperado))
+    c3.metric("Total pendente", brl(total_pend))
+    c4.metric("Créditos a favor", brl(total_cred))
 
     st.divider()
-    st.markdown("##### Situação por imóvel")
-    tabela = []
-    for r in imoveis.itertuples():
-        s = saldos[int(r.id)]
-        if s > 0.005:
-            sit = "🔴 Em aberto"
-        elif s < -0.005:
-            sit = "🔵 Crédito"
-        else:
-            sit = "🟢 Em dia"
-        tabela.append({
-            "Imóvel": r.nome, "Inquilino": r.locatario or "—",
-            "Aluguel": brl(r.valor_aluguel), "Venc. (dia)": r.dia_vencimento,
-            "Saldo": brl(s), "Situação": sit, "Ativo": "Sim" if r.ativo else "Não",
-        })
-    st.dataframe(pd.DataFrame(tabela), use_container_width=True, hide_index=True)
+    tab = []
+    for _, r in lojas.iterrows():
+        s = saldos[r["Loja"]]
+        sit = "🔴 Em aberto" if s > 0.005 else ("🔵 Crédito" if s < -0.005 else "🟢 Em dia")
+        tab.append({"Loja": r["Loja"], "Responsável": r["Responsável"],
+                    "Aluguel": brl(num(r["Aluguel Atual"])), "Saldo": brl(s),
+                    "Situação": sit})
+    st.dataframe(pd.DataFrame(tab), use_container_width=True, hide_index=True)
 
-    # Recebimentos por mês (últimos 12)
-    if not lanc.empty:
-        cred = lanc[lanc["natureza"] == "credito"].copy()
-        if not cred.empty:
-            cred["mes"] = cred["data"].dt.strftime("%Y-%m")
-            serie = cred.groupby("mes")["valor"].sum().tail(12)
-            st.markdown("##### Recebimentos por mês")
-            st.bar_chart(serie)
+    # Reajustes próximos (até 45 dias)
+    avisos = []
+    for _, r in lojas.iterrows():
+        d = to_date(r.get("Próximo Reajuste"))
+        if d is not None and not pd.isna(d):
+            dias = (d.date() - hoje).days
+            if dias <= 45:
+                avisos.append((dias, r["Responsável"], d.date()))
+    if avisos:
+        st.markdown("##### 📈 Reajustes a vencer")
+        for dias, resp, d in sorted(avisos):
+            txt = f"**{resp}** — {d.strftime('%d/%m/%Y')}"
+            (st.warning if dias < 0 else st.info)(
+                txt + (f" (há {-dias} dias)" if dias < 0 else f" (em {dias} dias)"))
 
 
 def pagina_lancamentos():
     st.subheader("➕ Lançamentos")
-    imoveis = listar_imoveis()
-    if imoveis.empty:
+    lojas = ler("Lojas")
+    if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
+    op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
 
-    op = {f"{r.nome}" + (f" — {r.locatario}" if r.locatario else ""): int(r.id)
-          for r in imoveis.itertuples()}
-
-    with st.form("novo_lanc", clear_on_submit=True):
+    with st.form("novo", clear_on_submit=True):
         st.markdown("**Novo lançamento**")
-        col1, col2 = st.columns(2)
-        nome_sel = col1.selectbox("Imóvel", list(op.keys()))
-        tipo = col2.selectbox("Tipo", list(TIPOS.keys()))
-        col3, col4, col5 = st.columns(3)
-        data = col3.date_input("Data", value=dt.date.today(), format="DD/MM/YYYY")
-        valor = col4.number_input("Valor (R$)", min_value=0.0, step=50.0, format="%.2f")
-        comp = col5.text_input("Competência (mês do aluguel)",
-                               value=dt.date.today().strftime("%Y-%m"),
-                               help="Mês a que o lançamento se refere, ex: 2026-06")
-        desc = st.text_input("Descrição / observação", placeholder="ex.: Recebido via PIX")
-        natureza = TIPOS[tipo]
-        st.caption(f"Natureza: **{'COBRANÇA (+)' if natureza=='debito' else 'RECEBIMENTO (−)'}**"
-                   " — cobranças aumentam a dívida; recebimentos abatem.")
+        sel = st.selectbox("Imóvel", list(op.keys()))
+        loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
+        c1, c2, c3 = st.columns(3)
+        comp = c1.text_input("Competência (mês)", value=dt.date.today().strftime("%m/%Y"))
+        data = c2.date_input("Data do pagamento", value=dt.date.today(), format="DD/MM/YYYY")
+        aluguel = c3.number_input("Aluguel devido", min_value=0.0,
+                                  value=num(loja_row["Aluguel Atual"]), step=50.0, format="%.2f")
+        c4, c5, c6 = st.columns(3)
+        iptu = c4.number_input("IPTU / Taxa", min_value=0.0, step=10.0, format="%.2f")
+        multa = c5.number_input("Multa / Juros", min_value=0.0, step=10.0, format="%.2f")
+        pago = c6.number_input("Valor pago", min_value=0.0, step=50.0, format="%.2f")
+        c7, c8 = st.columns(2)
+        produtos = c7.number_input("Pago em produtos", min_value=0.0, step=10.0, format="%.2f")
+        obs = c8.text_input("Observação")
+        st.caption("Dica: lance o **Aluguel devido** uma vez por mês. Em pagamentos extras "
+                   "do mesmo mês, deixe o aluguel = 0 para não duplicar a cobrança.")
         if st.form_submit_button("Lançar", type="primary"):
-            if valor <= 0:
-                st.error("Informe um valor maior que zero.")
-            else:
-                add_lancamento(imovel_id=op[nome_sel], data=data, competencia=comp,
-                               tipo=tipo, valor=valor, descricao=desc)
-                st.success(f"Lançado: {tipo} de {brl(valor)} em {nome_sel}.")
-                st.rerun()
+            ws("Pagamentos").append_row(
+                [op[sel], comp, data.strftime("%d/%m/%Y"), aluguel, iptu, multa,
+                 pago, produtos, obs],
+                value_input_option="USER_ENTERED")
+            st.success("Lançamento salvo na planilha.")
+            st.rerun()
 
     st.divider()
     with st.expander("🧮 Multa / juros por atraso (opcional)"):
-        st.caption("Calcule a multa e os juros — e escolha **cobrar ou perdoar**. "
-                   "Os percentuais vêm do contrato de cada imóvel (editáveis na aba Imóveis).")
-        nome_mj = st.selectbox("Imóvel", list(op.keys()), key="mj_imovel")
-        row_mj = imoveis[imoveis["id"] == op[nome_mj]].iloc[0]
-        cobrar = st.checkbox("Cobrar multa/juros (desmarque para perdoar)", value=True)
+        st.caption("Calcule e decida se cobra ou perdoa. Os % vêm do cadastro do imóvel.")
+        selm = st.selectbox("Imóvel", list(op.keys()), key="mj")
+        lr = lojas[lojas["Loja"] == op[selm]].iloc[0]
         m1, m2, m3 = st.columns(3)
-        base = m1.number_input("Valor base (R$)", min_value=0.0,
-                               value=float(row_mj["valor_aluguel"]), step=50.0,
-                               format="%.2f", key="mj_base")
+        base = m1.number_input("Valor base", min_value=0.0,
+                               value=num(lr["Aluguel Atual"]), step=50.0, format="%.2f", key="mjb")
         venc = m2.date_input("Vencimento", value=dt.date.today().replace(day=1),
-                             format="DD/MM/YYYY", key="mj_venc")
-        pgto = m3.date_input("Data do pagamento", value=dt.date.today(),
-                             format="DD/MM/YYYY", key="mj_pgto")
+                             format="DD/MM/YYYY", key="mjv")
+        pgto = m3.date_input("Pagamento", value=dt.date.today(), format="DD/MM/YYYY", key="mjp")
         m4, m5 = st.columns(2)
-        multa_pct = m4.number_input("Multa (%)", min_value=0.0,
-                                    value=float(row_mj.get("multa_pct") or 2.0),
-                                    step=0.5, format="%.2f", key="mj_multa")
-        juros_pct = m5.number_input("Juros ao mês (%)", min_value=0.0,
-                                    value=float(row_mj.get("juros_pct_mes") or 1.0),
-                                    step=0.5, format="%.2f", key="mj_juros")
+        mpct = m4.number_input("Multa %", min_value=0.0, value=num(lr["Multa %"]) or 2.0,
+                               step=0.5, format="%.2f", key="mjm")
+        jpct = m5.number_input("Juros % a.m.", min_value=0.0, value=num(lr["Juros % a.m."]) or 1.0,
+                               step=0.5, format="%.2f", key="mjj")
         dias = max((pgto - venc).days, 0)
-        multa_v, juros_v, total_v = calcular_multa_juros(base, dias, multa_pct, juros_pct)
-
+        mv = round(base * mpct / 100, 2)
+        jv = round(base * jpct / 100 * dias / 30, 2)
+        tot = round(mv + jv, 2)
         if dias <= 0:
-            st.info("Sem atraso — nenhuma multa/juros a cobrar.")
+            st.info("Sem atraso.")
         else:
-            st.write(f"Atraso de **{dias} dia(s)** · Multa: {brl(multa_v)} · "
-                     f"Juros: {brl(juros_v)} · **Total: {brl(total_v)}**")
-
-        if not cobrar:
-            st.warning("Multa/juros **perdoados** — nada será cobrado.")
-            if st.button("Registrar perdão (observação)"):
-                add_lancamento(imovel_id=op[nome_mj], data=pgto,
-                               competencia=venc.strftime("%Y-%m"),
-                               tipo="Desconto / Abatimento", valor=0.0,
-                               descricao=f"Multa/juros perdoados (atraso {dias} dias)")
-                st.success("Perdão registrado no histórico.")
-                st.rerun()
-        elif total_v > 0:
-            if st.button("Lançar multa/juros", type="primary"):
-                add_lancamento(imovel_id=op[nome_mj], data=pgto,
-                               competencia=venc.strftime("%Y-%m"),
-                               tipo="Multa / Juros", valor=total_v,
-                               descricao=f"Atraso {dias} dias — multa {multa_pct}% "
-                                         f"+ juros {juros_pct}%/mês")
-                st.success(f"Multa/juros de {brl(total_v)} lançada.")
-                st.rerun()
+            st.write(f"Atraso **{dias} dia(s)** · Multa {brl(mv)} · Juros {brl(jv)} · "
+                     f"**Total {brl(tot)}**")
 
     st.divider()
-    st.markdown("**Histórico**")
-    filtro = st.selectbox("Filtrar por imóvel", ["Todos"] + list(op.keys()))
-    imovel_id = None if filtro == "Todos" else op[filtro]
-    df = listar_lancamentos(imovel_id)
-    if df.empty:
+    st.markdown("**Últimos lançamentos**")
+    pags = ler("Pagamentos")
+    if pags.empty:
         st.info("Sem lançamentos ainda.")
         return
-
-    mapa_nome = {int(r.id): r.nome for r in imoveis.itertuples()}
-    df = df.sort_values("data", ascending=False)
-    for r in df.itertuples():
-        sinal = "＋" if r.natureza == "debito" else "−"
+    nomes = {r["Loja"]: r["Responsável"] for _, r in lojas.iterrows()}
+    pags = pags.reset_index()  # index 0-based; linha real = index+2
+    for _, r in pags.tail(15).iloc[::-1].iterrows():
+        linha_planilha = int(r["index"]) + 2
         c1, c2 = st.columns([6, 1])
-        c1.write(
-            f"**{r.data.strftime('%d/%m/%Y')}** · {mapa_nome.get(r.imovel_id,'?')} · "
-            f"{r.tipo} · {sinal} {brl(r.valor)}"
-            + (f" · _{r.descricao}_" if r.descricao else "")
-        )
-        if c2.button("🗑️", key=f"del{r.id}"):
-            del_lancamento(int(r.id))
+        c1.write(f'**{r.get("Data Pagamento","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
+                 f'devido {brl(num(r["Aluguel Devido"]))} · pago {brl(num(r["Valor Pago"]))}'
+                 + (f' · _{r["Observação"]}_' if r.get("Observação") else ""))
+        if c2.button("🗑️", key=f"d{linha_planilha}"):
+            ws("Pagamentos").delete_rows(linha_planilha)
             st.rerun()
 
 
 def pagina_extrato():
     st.subheader("📄 Extrato por imóvel")
-    imoveis = listar_imoveis()
-    if imoveis.empty:
+    lojas, pags = ler("Lojas"), ler("Pagamentos")
+    if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
-    op = {f"{r.nome}" + (f" — {r.locatario}" if r.locatario else ""): int(r.id)
-          for r in imoveis.itertuples()}
-    nome_sel = st.selectbox("Imóvel", list(op.keys()))
-    imovel_id = op[nome_sel]
+    op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
+    sel = st.selectbox("Imóvel", list(op.keys()))
+    loja_id = op[sel]
+    lr = lojas[lojas["Loja"] == loja_id].iloc[0]
+    saldo = num(lr["Saldo Inicial"])
 
-    with get_session() as s:
-        imv = s.get(Imovel, imovel_id)
-        saldo_ini = imv.saldo_inicial
-        info = (imv.nome, imv.locatario, imv.telefone, imv.valor_aluguel)
-
-    df = listar_lancamentos(imovel_id).sort_values(["data", "id"])
-    st.write(f"**{info[0]}** · Inquilino: {info[1] or '—'} · "
-             f"Aluguel: {brl(info[3])} · Tel.: {info[2] or '—'}")
-
+    p = pags[pags["Loja"].astype(str) == str(loja_id)].copy() if not pags.empty else pd.DataFrame()
     linhas = []
-    saldo = saldo_ini
-    if saldo_ini:
-        linhas.append({"Data": "—", "Tipo": "Saldo inicial", "Cobrança": "",
-                       "Recebido": "", "Saldo": brl(saldo), "Obs.": ""})
-    for r in df.itertuples():
-        if r.natureza == "debito":
-            saldo += r.valor
-            cob, rec = brl(r.valor), ""
-        else:
-            saldo -= r.valor
-            cob, rec = "", brl(r.valor)
-        linhas.append({
-            "Data": r.data.strftime("%d/%m/%Y"), "Tipo": r.tipo,
-            "Cobrança": cob, "Recebido": rec, "Saldo": brl(saldo),
-            "Obs.": r.descricao,
-        })
-    extrato = pd.DataFrame(linhas)
-    st.dataframe(extrato, use_container_width=True, hide_index=True)
-
-    s_final = saldo
-    if s_final > 0.005:
-        st.error(f"Saldo devedor atual: **{brl(s_final)}**")
-    elif s_final < -0.005:
-        st.info(f"Crédito a favor do inquilino: **{brl(-s_final)}**")
+    if saldo:
+        linhas.append({"Data": "—", "Lançamento": "Saldo inicial", "Cobrança": "",
+                       "Recebido": "", "Saldo": brl(saldo)})
+    if not p.empty:
+        p["__d"] = p["Data Pagamento"].apply(to_date)
+        p = p.sort_values("__d", na_position="last")
+        for _, r in p.iterrows():
+            cob = num(r["Aluguel Devido"]) + num(r["IPTU/Taxa"]) + num(r["Multa/Juros"])
+            rec = num(r["Valor Pago"]) + num(r["Pago em Produtos"])
+            saldo += cob - rec
+            linhas.append({"Data": r.get("Data Pagamento", ""),
+                           "Lançamento": r.get("Observação", "") or "Movimentação",
+                           "Cobrança": brl(cob) if cob else "",
+                           "Recebido": brl(rec) if rec else "", "Saldo": brl(saldo)})
+    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+    if saldo > 0.005:
+        st.error(f"Saldo devedor atual: **{brl(saldo)}**")
+    elif saldo < -0.005:
+        st.info(f"Crédito a favor: **{brl(-saldo)}**")
     else:
         st.success("Conta em dia. ✅")
 
-    # Exportar para Excel
-    if not extrato.empty:
-        import io
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-            extrato.to_excel(xw, index=False, sheet_name="Extrato")
-        st.download_button("⬇️ Baixar extrato (Excel)", buf.getvalue(),
-                           file_name=f"extrato_{info[0]}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+def pagina_reajustes():
+    st.subheader("📈 Reajustes")
+    lojas = ler("Lojas")
+    if lojas.empty:
+        st.info("Cadastre um imóvel primeiro.")
+        return
+    op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
+    with st.form("reaj", clear_on_submit=True):
+        sel = st.selectbox("Imóvel", list(op.keys()))
+        lr = lojas[lojas["Loja"] == op[sel]].iloc[0]
+        c1, c2, c3 = st.columns(3)
+        data = c1.date_input("Data", value=dt.date.today(), format="DD/MM/YYYY")
+        indice = c2.selectbox("Índice", ["IGP-M", "IPCA", "INCC", "IGP-DI", "Outro"])
+        perc = c3.number_input("Reajuste (%)", value=0.0, step=0.5, format="%.2f")
+        atual = num(lr["Aluguel Atual"])
+        novo = round(atual * (1 + perc / 100), 2)
+        st.write(f"Atual: **{brl(atual)}** → Novo: **{brl(novo)}**")
+        if st.form_submit_button("Aplicar reajuste", type="primary"):
+            if perc == 0:
+                st.warning("Informe um percentual.")
+            else:
+                ws("Reajustes").append_row(
+                    [op[sel], data.strftime("%d/%m/%Y"), indice, perc, atual, novo],
+                    value_input_option="USER_ENTERED")
+                # atualiza o aluguel atual e o próximo reajuste na aba Lojas
+                wl = ws("Lojas")
+                cell = wl.find(str(op[sel]), in_column=1)
+                wl.update_cell(cell.row, 3, novo)
+                wl.update_cell(cell.row, 9, (data + dt.timedelta(days=365)).strftime("%d/%m/%Y"))
+                st.success(f"Reajuste aplicado: {brl(atual)} → {brl(novo)}.")
+                st.rerun()
+    st.divider()
+    st.markdown("**Histórico**")
+    dfr = ler("Reajustes")
+    if dfr.empty:
+        st.info("Nenhum reajuste registrado.")
+    else:
+        st.dataframe(dfr, use_container_width=True, hide_index=True)
 
 
 def pagina_imoveis():
     st.subheader("🏠 Imóveis")
-    imoveis = listar_imoveis()
-
-    with st.expander("➕ Cadastrar novo imóvel"):
-        with st.form("novo_imovel", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            nome = c1.text_input("Nome / identificação *")
-            loc = c2.text_input("Inquilino")
-            c3, c4, c5 = st.columns(3)
-            val = c3.number_input("Valor do aluguel (R$)", min_value=0.0, step=50.0, format="%.2f")
-            dia = c4.number_input("Dia do vencimento", min_value=1, max_value=31, value=1)
-            sini = c5.number_input("Saldo inicial / pendência herdada (R$)",
-                                   step=50.0, format="%.2f",
-                                   help="Pendência que já existia no controle antigo.")
-            cm1, cm2 = st.columns(2)
-            multa_pct = cm1.number_input("Multa por atraso (%)", min_value=0.0,
-                                         value=2.0, step=0.5, format="%.2f")
-            juros_pct = cm2.number_input("Juros ao mês (%)", min_value=0.0,
-                                         value=1.0, step=0.5, format="%.2f")
-            tel = st.text_input("Telefone")
-            end = st.text_input("Endereço")
-            obs = st.text_area("Observações")
-            if st.form_submit_button("Salvar", type="primary"):
-                if not nome:
-                    st.error("Informe o nome do imóvel.")
-                else:
-                    add_imovel(nome=nome, locatario=loc, valor_aluguel=val,
-                               dia_vencimento=int(dia), saldo_inicial=sini,
-                               multa_pct=multa_pct, juros_pct_mes=juros_pct,
-                               telefone=tel, endereco=end, observacao=obs,
-                               ativo=True)
-                    st.success("Imóvel cadastrado.")
-                    st.rerun()
-
-    if imoveis.empty:
-        st.info("Nenhum imóvel cadastrado ainda.")
+    lojas = ler("Lojas")
+    if lojas.empty:
+        st.info("Nenhum imóvel cadastrado.")
         return
-
-    st.markdown("##### Editar imóveis")
-    for r in imoveis.itertuples():
-        with st.expander(f"{r.nome}" + (f" — {r.locatario}" if r.locatario else "")):
-            with st.form(f"edit{r.id}"):
+    for _, r in lojas.iterrows():
+        with st.expander(f'{r["Loja"]} — {r["Responsável"]}'):
+            with st.form(f'e{r["Loja"]}'):
                 c1, c2 = st.columns(2)
-                nome = c1.text_input("Nome", value=r.nome)
-                loc = c2.text_input("Inquilino", value=r.locatario or "")
+                resp = c1.text_input("Responsável", value=str(r["Responsável"]))
+                aluguel = c2.number_input("Aluguel atual", value=num(r["Aluguel Atual"]),
+                                          step=50.0, format="%.2f")
                 c3, c4, c5 = st.columns(3)
-                val = c3.number_input("Aluguel (R$)", value=float(r.valor_aluguel),
-                                      step=50.0, format="%.2f")
-                dia = c4.number_input("Vencimento", min_value=1, max_value=31,
-                                      value=int(r.dia_vencimento))
-                sini = c5.number_input("Saldo inicial (R$)",
-                                       value=float(r.saldo_inicial), step=50.0, format="%.2f")
-                cm1, cm2 = st.columns(2)
-                multa_pct = cm1.number_input("Multa por atraso (%)", min_value=0.0,
-                                             value=float(r.multa_pct or 2.0),
-                                             step=0.5, format="%.2f")
-                juros_pct = cm2.number_input("Juros ao mês (%)", min_value=0.0,
-                                             value=float(r.juros_pct_mes or 1.0),
-                                             step=0.5, format="%.2f")
-                tel = st.text_input("Telefone", value=r.telefone or "")
-                end = st.text_input("Endereço", value=r.endereco or "")
-                obs = st.text_area("Observações", value=r.observacao or "")
-                ativo = st.checkbox("Ativo (locado)", value=bool(r.ativo))
-                cc1, cc2 = st.columns(2)
-                if cc1.form_submit_button("💾 Salvar", type="primary"):
-                    update_imovel(int(r.id), nome=nome, locatario=loc, valor_aluguel=val,
-                                  dia_vencimento=int(dia), saldo_inicial=sini,
-                                  multa_pct=multa_pct, juros_pct_mes=juros_pct,
-                                  telefone=tel, endereco=end, observacao=obs, ativo=ativo)
+                dia = c3.number_input("Dia vcto", min_value=1, max_value=31,
+                                      value=int(num(r["Dia Vcto"]) or 1))
+                sini = c4.number_input("Saldo inicial", value=num(r["Saldo Inicial"]),
+                                       step=50.0, format="%.2f")
+                prox = c5.text_input("Próximo reajuste (dd/mm/aaaa)",
+                                     value=str(r.get("Próximo Reajuste", "")))
+                c6, c7 = st.columns(2)
+                mpct = c6.number_input("Multa %", value=num(r["Multa %"]) or 2.0, step=0.5)
+                jpct = c7.number_input("Juros % a.m.", value=num(r["Juros % a.m."]) or 1.0, step=0.5)
+                obs = st.text_area("Observação", value=str(r.get("Observação", "")))
+                if st.form_submit_button("💾 Salvar", type="primary"):
+                    wl = ws("Lojas")
+                    cell = wl.find(str(r["Loja"]), in_column=1)
+                    wl.update(f"B{cell.row}:J{cell.row}",
+                              [[resp, aluguel, dia, str(r.get("Início Contrato", "")),
+                                sini, mpct, jpct, prox, obs]],
+                              value_input_option="USER_ENTERED")
                     st.success("Atualizado.")
-                    st.rerun()
-                if cc2.form_submit_button("🗑️ Excluir imóvel"):
-                    del_imovel(int(r.id))
-                    st.warning("Imóvel excluído (com seus lançamentos).")
                     st.rerun()
 
 
@@ -566,25 +419,25 @@ def main():
     st.set_page_config(page_title="Gestão de Aluguéis", page_icon="🏠", layout="wide")
     if not checar_senha():
         return
-    seed_se_vazio()
-
     st.sidebar.title("🏠 Gestão de Aluguéis")
-    pagina = st.sidebar.radio(
-        "Menu", ["Dashboard", "Lançamentos", "Extrato", "Imóveis"]
-    )
+    pag = st.sidebar.radio("Menu", ["Dashboard", "Lançamentos", "Extrato",
+                                    "Reajustes", "Imóveis"])
     st.sidebar.divider()
+    if st.sidebar.button("🔄 Recarregar dados"):
+        st.cache_resource.clear()
+        st.rerun()
     if st.sidebar.button("Sair"):
-        st.session_state["autenticado"] = False
+        st.session_state["ok"] = False
         st.rerun()
 
-    if pagina == "Dashboard":
-        pagina_dashboard()
-    elif pagina == "Lançamentos":
-        pagina_lancamentos()
-    elif pagina == "Extrato":
-        pagina_extrato()
-    elif pagina == "Imóveis":
-        pagina_imoveis()
+    try:
+        {"Dashboard": pagina_dashboard, "Lançamentos": pagina_lancamentos,
+         "Extrato": pagina_extrato, "Reajustes": pagina_reajustes,
+         "Imóveis": pagina_imoveis}[pag]()
+    except Exception as e:
+        st.error(f"Erro ao acessar a planilha: {e}")
+        st.caption("Verifique se a planilha foi compartilhada com o e-mail da conta "
+                   "de serviço (client_email) e se o sheet_key está correto.")
 
 
 if __name__ == "__main__":
