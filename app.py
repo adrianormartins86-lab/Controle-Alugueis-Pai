@@ -10,35 +10,29 @@ st.set_page_config(page_title="Controle de Inquilinos", layout="wide")
 # ==========================================
 st.sidebar.title("⚙️ Sistema")
 if st.sidebar.button("🔄 Sincronizar com Sheets", use_container_width=True):
-    # Limpa o cache para forçar a leitura de dados novos do Google Sheets
     st.cache_data.clear()
     st.rerun()
 st.sidebar.info("Dica: Clique no botão acima sempre que você preencher ou alterar dados diretamente pelo Google Sheets.")
 
 st.title("🏢 Controle de Aluguéis")
 
-# Função auxiliar para formatar valores no padrão de moeda brasileiro
 def formatar_brl(valor):
     try:
         return f"R$ {float(valor):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
     except:
         return "R$ 0,00"
 
-# Conectando com o Google Sheets
+# Conexão e Carregamento
 conn = st.connection("gsheets", type=GSheetsConnection)
-
-# Carregando as abas
 df_lojas = conn.read(worksheet="Lojas", ttl=0).dropna(how="all")
 df_pagamentos = conn.read(worksheet="Pagamentos", ttl=0).dropna(how="all")
 
-# Garantir que apenas as colunas essenciais de contrato existam no df_lojas
+# Garantir Colunas Lojas
 for col in ["Responsável", "Início Contrato", "Aluguel Devido"]:
     if col not in df_lojas.columns:
         df_lojas[col] = ""
 
-# ==========================================
-# TRATAMENTO DE TIPOS DE DADOS E CORREÇÃO DE ERROS
-# ==========================================
+# Tratamento de Tipos
 if 'Loja' in df_lojas.columns:
     df_lojas['Loja'] = df_lojas['Loja'].astype(str).str.replace(r'\.0$', '', regex=True)
 
@@ -47,13 +41,12 @@ if 'Loja' in df_pagamentos.columns:
 
 df_lojas['Início Contrato'] = df_lojas['Início Contrato'].astype('object')
 
-# Garantir que colunas financeiras (incluindo IPTU e Valor Aluguel) existam no df_pagamentos
-for col in ["Valor Aluguel", "IPTU", "Valor Pago", "R$Diferença"]:
+# Garantir Colunas Pagamentos (Mês Referência voltou!)
+for col in ["Mês Referência", "Valor Aluguel", "IPTU", "Valor Pago", "R$Diferença"]:
     if col not in df_pagamentos.columns:
-        df_pagamentos[col] = 0.0
+        df_pagamentos[col] = "" if col == "Mês Referência" else 0.0
 
-# Criando abas no Streamlit
-tab1, tab2, tab3 = st.tabs(["📝 Lançar Pagamento", "📊 Visão Geral", "🔄 Contratos e Reajustes"])
+tab1, tab2, tab3 = st.tabs(["📝 Lançar Pagamento", "📊 Visão Geral (Extrato)", "🔄 Contratos e Reajustes"])
 
 # ==========================================
 # ABA 1: Lançar Pagamento
@@ -61,29 +54,48 @@ tab1, tab2, tab3 = st.tabs(["📝 Lançar Pagamento", "📊 Visão Geral", "🔄
 with tab1:
     st.header("Novo Lançamento")
     
-    lista_lojas = df_lojas['Loja'].dropna().tolist()
-    loja_selecionada = st.selectbox("Selecione a Loja", lista_lojas, key="loja_pag")
+    # --- LINHA 1: Loja | Responsável | Mês Referência ---
+    col1, col2, col3 = st.columns(3)
     
+    with col1:
+        lista_lojas = df_lojas['Loja'].dropna().tolist()
+        loja_selecionada = st.selectbox("Selecione a Loja", lista_lojas, key="loja_pag")
+    
+    # Busca automática do Responsável e do Aluguel
     try:
-        linha_loja = df_lojas[df_lojas['Loja'] == loja_selecionada]
-        aluguel_devido_atual = pd.to_numeric(linha_loja['Aluguel Devido'], errors='coerce').fillna(0).values[0]
+        linha_loja = df_lojas[df_lojas['Loja'] == loja_selecionada].iloc[0]
+        aluguel_devido_atual = float(pd.to_numeric(linha_loja['Aluguel Devido'], errors='coerce'))
+        responsavel_atual = str(linha_loja['Responsável'])
+        if responsavel_atual.lower() == 'nan': responsavel_atual = "Não cadastrado"
     except:
         aluguel_devido_atual = 0.0
-
-    st.info(f"💰 **Valor do Aluguel Cadastrado para a {loja_selecionada}:** {formatar_brl(aluguel_devido_atual)}")
-    
-    with st.form("form_pagamento", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+        responsavel_atual = "Não encontrado"
         
-        with col1:
+    with col2:
+        st.text_input("Responsável (Inquilino)", value=responsavel_atual, disabled=True)
+        
+    with col3:
+        # Gera uma lista de meses (anos 2024 a 2027)
+        meses = [f"{str(m).zfill(2)}/{y}" for y in range(2024, 2028) for m in range(1, 13)]
+        mes_atual_str = date.today().strftime("%m/%Y")
+        idx_mes = meses.index(mes_atual_str) if mes_atual_str in meses else len(meses)//2
+        mes_referencia = st.selectbox("Mês de Referência", meses, index=idx_mes)
+
+    st.info(f"💰 **Valor do Aluguel Base Cadastrado:** {formatar_brl(aluguel_devido_atual)}")
+    
+    # --- LINHA 2: Data | Valor Pago | IPTU ---
+    with st.form("form_pagamento", clear_on_submit=True):
+        col_f1, col_f2, col_f3 = st.columns(3)
+        
+        with col_f1:
             data_pagamento = st.date_input("Data do Pagamento", date.today(), format="DD/MM/YYYY")
+        with col_f2:
+            valor_pago = st.number_input("Valor Pago (R$)", min_value=0.0, step=50.0)
+        with col_f3:
             valor_iptu = st.number_input("Taxa de IPTU (R$)", min_value=0.0, value=0.0, step=50.0)
             
-        with col2:
-            valor_pago = st.number_input("Valor Total Pago (R$)", min_value=0.0, step=50.0)
-            st.write("") 
-            st.write("") 
-            submit = st.form_submit_button("Registrar Pagamento", use_container_width=True)
+        st.write("") 
+        submit = st.form_submit_button("Registrar Pagamento", use_container_width=True)
         
         if submit:
             total_esperado = aluguel_devido_atual + valor_iptu
@@ -92,118 +104,96 @@ with tab1:
             novo_lancamento = pd.DataFrame([{
                 "Data Pagamento": data_pagamento.strftime("%d/%m/%Y"),
                 "Loja": loja_selecionada,
+                "Mês Referência": mes_referencia,
                 "Valor Aluguel": aluguel_devido_atual,
                 "IPTU": valor_iptu,
                 "Valor Pago": valor_pago,
                 "R$Diferença": diferenca
             }])
             
-            # Garante que a ordem das colunas ao salvar seja exatamente a mesma da planilha atual
             novo_lancamento = novo_lancamento.reindex(columns=df_pagamentos.columns)
-            
             df_atualizado = pd.concat([df_pagamentos, novo_lancamento], ignore_index=True)
             conn.update(worksheet="Pagamentos", data=df_atualizado)
             
-            # Força a limpeza de cache após salvar via sistema
             st.cache_data.clear()
             
             if diferenca > 0:
-                st.warning(f"Pagamento parcial registrado! Restou uma diferença de {formatar_brl(diferenca)} neste lançamento.")
+                st.warning(f"Pagamento parcial registrado! Restou uma diferença de {formatar_brl(diferenca)}.")
             else:
                 st.success(f"Pagamento de {formatar_brl(valor_pago)} para a {loja_selecionada} registrado com sucesso!")
             
             st.rerun()
 
 # ==========================================
-# ABA 2: Visão Geral (DASHBOARD INTELIGENTE)
+# ABA 2: Visão Geral (ESTILO EXCEL / EXTRATO)
 # ==========================================
 with tab2:
-    st.header("Status dos Aluguéis")
+    st.header("Extrato de Pagamentos")
+    st.write("Visualize todo o histórico de lançamentos como em uma planilha.")
     
     if not df_pagamentos.empty:
-        df_pagamentos['Data_Temp'] = pd.to_datetime(df_pagamentos['Data Pagamento'], format='%d/%m/%Y', errors='coerce')
-        df_pagamentos['Mês/Ano'] = df_pagamentos['Data_Temp'].dt.strftime('%m/%Y')
+        opcoes_loja = ["Todas"] + df_lojas['Loja'].dropna().tolist()
+        loja_filtro = st.selectbox("Filtrar por Loja", opcoes_loja)
         
-        meses_disponiveis = df_pagamentos['Mês/Ano'].dropna().unique().tolist()
-        meses_disponiveis.sort(reverse=True) 
-        
-        if not meses_disponiveis:
-            meses_disponiveis = [date.today().strftime('%m/%Y')]
-            
-        col_filtro1, col_filtro2 = st.columns(2)
-        with col_filtro1:
-            mes_analise = st.selectbox("Selecione o Mês do Pagamento", meses_disponiveis)
-        with col_filtro2:
-            opcoes_loja = ["Todas"] + df_lojas['Loja'].dropna().tolist()
-            loja_filtro = st.selectbox("Filtrar por Loja", opcoes_loja)
-        
-        df_mes = df_pagamentos[df_pagamentos["Mês/Ano"] == mes_analise]
-        
-        # O SEGREDRO: Agora agrupamos e buscamos o 'Valor Aluguel' do histórico, não apenas os pagamentos
-        pagamentos_agrupados = df_mes.groupby("Loja").agg({
-            "Valor Pago": "sum",
-            "IPTU": "sum",
-            "Valor Aluguel": "max" # Pega o valor da época do contrato salvo no Pagamento
-        }).reset_index()
-        
-        df_resumo = pd.merge(df_lojas, pagamentos_agrupados, on="Loja", how="left")
-        
-        # Tratamento financeiro isolado para não conflitar com nulos
-        df_resumo["Valor Pago"] = pd.to_numeric(df_resumo["Valor Pago"], errors='coerce').fillna(0)
-        df_resumo["IPTU"] = pd.to_numeric(df_resumo["IPTU"], errors='coerce').fillna(0)
-        df_resumo["Aluguel Devido Atual"] = pd.to_numeric(df_resumo["Aluguel Devido"], errors='coerce').fillna(0)
-        df_resumo["Valor Aluguel Histórico"] = pd.to_numeric(df_resumo["Valor Aluguel"], errors='coerce')
-        
-        # BI Lógica: Se o inquilino pagou no mês, usa o valor histórico do aluguel. Se não pagou nada, projeta o aluguel atual.
-        df_resumo["Aluguel Considerado"] = df_resumo["Valor Aluguel Histórico"].fillna(df_resumo["Aluguel Devido Atual"])
-            
-        df_resumo["Total Esperado"] = df_resumo["Aluguel Considerado"] + df_resumo["IPTU"]
-        df_resumo["Valor Devedor"] = df_resumo["Total Esperado"] - df_resumo["Valor Pago"]
-        
-        df_display = df_resumo[["Loja", "Responsável", "Aluguel Considerado", "IPTU", "Total Esperado", "Valor Pago", "Valor Devedor"]].copy()
-        
-        # Renomeia para exibição limpa
-        df_display.rename(columns={"Aluguel Considerado": "Aluguel Devido"}, inplace=True)
+        df_extrato = df_pagamentos.copy()
         
         if loja_filtro != "Todas":
-            df_display = df_display[df_display["Loja"] == loja_filtro]
+            df_extrato = df_extrato[df_extrato["Loja"] == loja_filtro]
+            
+        # Converte para números para cálculos seguros
+        for col in ["Valor Aluguel", "IPTU", "Valor Pago", "R$Diferença"]:
+            df_extrato[col] = pd.to_numeric(df_extrato[col], errors='coerce').fillna(0)
+            
+        # Ordena por data (do mais recente para o mais antigo)
+        df_extrato['Data_Temp'] = pd.to_datetime(df_extrato['Data Pagamento'], format='%d/%m/%Y', errors='coerce')
+        df_extrato = df_extrato.sort_values(by='Data_Temp', ascending=False).drop(columns=['Data_Temp'])
         
-        total_esperado_geral = df_display["Total Esperado"].sum()
-        total_recebido_geral = df_display["Valor Pago"].sum()
-        total_pendente_geral = df_display["Valor Devedor"].sum()
-        
-        st.write("")
+        # Métricas Globais do Filtro Atual
+        tot_pago = df_extrato["Valor Pago"].sum()
+        tot_iptu = df_extrato["IPTU"].sum()
+        tot_diferenca = df_extrato["R$Diferença"].sum()
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Esperado", formatar_brl(total_esperado_geral))
-        col2.metric("Total Recebido", formatar_brl(total_recebido_geral))
-        col3.metric("Pendente (Devedor/Crédito)", formatar_brl(total_pendente_geral))
+        col1.metric("Total Pago (Período)", formatar_brl(tot_pago))
+        col2.metric("Total IPTU Arrecadado", formatar_brl(tot_iptu))
+        col3.metric("Saldo Pendente Acumulado", formatar_brl(tot_diferenca))
         
         st.divider()
         
-        def destacar_devedores(row):
-            if row['Valor Devedor'] > 0:
-                return ['background-color: #ffcccc'] * len(row)
-            return ['background-color: #ccffcc'] * len(row)
+        # Traz o nome do responsável para a tabela se for "Todas" as lojas
+        if loja_filtro == "Todas":
+            df_extrato = pd.merge(df_extrato, df_lojas[["Loja", "Responsável"]], on="Loja", how="left")
+            cols = ["Data Pagamento", "Mês Referência", "Loja", "Responsável", "Valor Aluguel", "IPTU", "Valor Pago", "R$Diferença"]
+        else:
+            cols = ["Data Pagamento", "Mês Referência", "Valor Aluguel", "IPTU", "Valor Pago", "R$Diferença"]
+            
+        # Exibe apenas as colunas que existem
+        cols = [c for c in cols if c in df_extrato.columns]
+        df_display = df_extrato[cols]
+        
+        def destacar_extrato(row):
+            if row.get('R$Diferença', 0) > 0:
+                return ['background-color: #ffcccc'] * len(row) # Vermelho (Devendo)
+            elif row.get('R$Diferença', 0) < 0:
+                return ['background-color: #cce5ff'] * len(row) # Azul (Crédito/Pagou a mais)
+            return [''] * len(row) # Branco/Padrão (Pago exato)
             
         df_estilizado = df_display.style.format({
-            "Aluguel Devido": formatar_brl,
+            "Valor Aluguel": formatar_brl,
             "IPTU": formatar_brl,
-            "Total Esperado": formatar_brl,
             "Valor Pago": formatar_brl,
-            "Valor Devedor": formatar_brl
-        }).apply(destacar_devedores, axis=1)
+            "R$Diferença": formatar_brl
+        }).apply(destacar_extrato, axis=1)
             
         st.dataframe(df_estilizado, use_container_width=True)
     else:
-        st.info("Nenhum pagamento registrado ainda. Realize o primeiro lançamento.")
+        st.info("Nenhum pagamento registrado ainda.")
 
 # ==========================================
 # ABA 3: Contratos e Reajustes
 # ==========================================
 with tab3:
     st.header("Atualizar Contratos e Reajustar Aluguel")
-    st.write("Atualize os dados do inquilino ou ajuste o valor base do aluguel.")
 
     with st.form("form_reajuste", clear_on_submit=True):
         col1, col2 = st.columns(2)
@@ -215,8 +205,7 @@ with tab3:
             dados_loja = df_lojas[df_lojas['Loja'] == loja_reajuste].iloc[0]
             valor_atual = float(pd.to_numeric(dados_loja.get('Aluguel Devido', 0), errors='coerce'))
             responsavel_atual = str(dados_loja.get('Responsável', ''))
-            if responsavel_atual.lower() == 'nan': 
-                responsavel_atual = ""
+            if responsavel_atual.lower() == 'nan': responsavel_atual = ""
         except:
             valor_atual = 0.0
             responsavel_atual = ""
@@ -238,21 +227,16 @@ with tab3:
             df_lojas.at[idx, 'Início Contrato'] = data_ajuste.strftime("%d/%m/%Y")
             
             conn.update(worksheet="Lojas", data=df_lojas)
-            
-            # Limpa o cache após atualizar via sistema
             st.cache_data.clear()
             
             st.success(f"Cadastro da {loja_reajuste} atualizado com sucesso!")
             st.rerun()
             
     st.subheader("Dados Atuais dos Contratos")
-    
     colunas_exibicao = [col for col in ['Loja', 'Responsável', 'Aluguel Devido', 'Início Contrato'] if col in df_lojas.columns]
     df_lojas_display = df_lojas[colunas_exibicao].copy()
     
     if 'Aluguel Devido' in df_lojas_display.columns:
         df_lojas_display['Aluguel Devido'] = pd.to_numeric(df_lojas_display['Aluguel Devido'], errors='coerce').fillna(0)
     
-    st.dataframe(df_lojas_display.style.format({
-        "Aluguel Devido": formatar_brl
-    }), use_container_width=True)
+    st.dataframe(df_lojas_display.style.format({"Aluguel Devido": formatar_brl}), use_container_width=True)
