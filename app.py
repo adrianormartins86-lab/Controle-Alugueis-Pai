@@ -90,8 +90,23 @@ def ws(nome):
     return get_spreadsheet().worksheet(nome)
 
 
-def ler(nome) -> pd.DataFrame:
-    return pd.DataFrame(ws(nome).get_all_records())
+def ler(nome, headers) -> pd.DataFrame:
+    """Lê a aba pegando só as colunas conhecidas (pela 1ª ocorrência do nome).
+    Ignora colunas extras ou cabeçalhos repetidos, evitando erros de duplicata."""
+    vals = ws(nome).get_all_values()
+    if not vals:
+        return pd.DataFrame(columns=headers)
+    head = vals[0]
+    width = len(head)
+    linhas = [list(r)[:width] + [""] * (width - len(r)) for r in vals[1:]]
+    base = pd.DataFrame(linhas, columns=[f"__c{i}" for i in range(width)])
+    out = {}
+    for h in headers:
+        out[h] = base[f"__c{head.index(h)}"] if h in head else ""
+    df = pd.DataFrame(out)
+    if headers and headers[0] in df.columns and not df.empty:
+        df = df[df[headers[0]].astype(str).str.strip() != ""]
+    return df.reset_index(drop=True)
 
 
 # ----------------------------------------------------------------------------- #
@@ -111,7 +126,7 @@ def num(v) -> float:
         return 0.0
     if isinstance(v, (int, float)):
         return float(v)
-    s = str(v).strip().replace("R$", "").replace(" ", "")
+    s = str(v).strip().replace("R$", "").replace("%", "").replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
@@ -169,7 +184,7 @@ def checar_senha() -> bool:
 # ----------------------------------------------------------------------------- #
 def pagina_dashboard():
     st.subheader("📊 Visão geral")
-    lojas, pags = ler("Lojas"), ler("Pagamentos")
+    lojas, pags = ler("Lojas", H_LOJAS), ler("Pagamentos", H_PAG)
     if lojas.empty:
         st.info("Cadastre imóveis na aba Imóveis.")
         return
@@ -223,7 +238,7 @@ def pagina_dashboard():
 
 def pagina_lancamentos():
     st.subheader("➕ Lançamentos")
-    lojas = ler("Lojas")
+    lojas = ler("Lojas", H_LOJAS)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
@@ -283,7 +298,7 @@ def pagina_lancamentos():
 
     st.divider()
     st.markdown("**Últimos lançamentos**")
-    pags = ler("Pagamentos")
+    pags = ler("Pagamentos", H_PAG)
     if pags.empty:
         st.info("Sem lançamentos ainda.")
         return
@@ -302,7 +317,7 @@ def pagina_lancamentos():
 
 def pagina_extrato():
     st.subheader("📄 Extrato por imóvel")
-    lojas, pags = ler("Lojas"), ler("Pagamentos")
+    lojas, pags = ler("Lojas", H_LOJAS), ler("Pagamentos", H_PAG)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
@@ -339,7 +354,7 @@ def pagina_extrato():
 
 def pagina_reajustes():
     st.subheader("📈 Reajustes")
-    lojas = ler("Lojas")
+    lojas = ler("Lojas", H_LOJAS)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
@@ -370,7 +385,7 @@ def pagina_reajustes():
                 st.rerun()
     st.divider()
     st.markdown("**Histórico**")
-    dfr = ler("Reajustes")
+    dfr = ler("Reajustes", H_REAJ)
     if dfr.empty:
         st.info("Nenhum reajuste registrado.")
     else:
@@ -379,7 +394,7 @@ def pagina_reajustes():
 
 def pagina_imoveis():
     st.subheader("🏠 Imóveis")
-    lojas = ler("Lojas")
+    lojas = ler("Lojas", H_LOJAS)
     if lojas.empty:
         st.info("Nenhum imóvel cadastrado.")
         return
