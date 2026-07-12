@@ -37,7 +37,7 @@ H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Dia Pgto",
            "Assinatura Contrato", "Débito Geral", "Caução", "Índice Reajuste",
            "Vencimento Contrato", "Observação"]
 
-INDICES = ["", "IGP-M", "IGP-DI", "IPCA", "INCC-DI"]
+INDICES = ["IGP-M", "IGP-DI", "IPCA", "INCC-DI"]
 
 # Aba Pagamentos — colunas A..J
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
@@ -168,6 +168,14 @@ def num(v) -> float:
         return float(s)
     except ValueError:
         return 0.0
+
+
+def parse_indices(v) -> list:
+    """'IGP-M, IPCA' -> ['IGP-M', 'IPCA']. Ignora o que não estiver em INDICES."""
+    if not v:
+        return []
+    itens = [x.strip() for x in str(v).replace(";", ",").split(",")]
+    return [x for x in itens if x in INDICES]
 
 
 def to_date(v):
@@ -549,11 +557,11 @@ def pagina_reajustes():
         lr = lojas[lojas["Loja"] == op[sel]].iloc[0]
         c1, c2, c3 = st.columns(3)
         data = c1.date_input("Data", value=dt.date.today(), format="DD/MM/YYYY")
-        opcoes_idx = [i for i in INDICES if i]
-        idx_cad = str(lr.get("Índice Reajuste", "")).strip()
-        pos = opcoes_idx.index(idx_cad) if idx_cad in opcoes_idx else 0
-        indice = c2.selectbox("Índice", opcoes_idx, index=pos,
-                              help="Sugerido pelo cadastro do imóvel.")
+        opcoes_idx = parse_indices(lr.get("Índice Reajuste", "")) or INDICES
+        indice = c2.selectbox(
+            "Índice", opcoes_idx,
+            help="Índices previstos no contrato deste imóvel (menu Imóveis). "
+                 "Sem cadastro, mostra todos.")
         perc = c3.number_input("Reajuste (%)", value=0.0, step=0.5, format="%.2f")
 
         atual = num(lr["Aluguel Atual"])
@@ -625,11 +633,12 @@ def pagina_imoveis():
                 assinatura = c5.text_input("Data Assinatura Contrato (dd/mm/aaaa)",
                                            value=str(r.get("Assinatura Contrato", "")))
 
-                idx_atual = str(r.get("Índice Reajuste", "")).strip()
-                pos = INDICES.index(idx_atual) if idx_atual in INDICES else 0
-                indice = c6.selectbox("Índice de Reajuste", INDICES, index=pos,
-                                      key=f"idx{r['Loja']}",
-                                      help="Índice previsto em contrato.")
+                indices_sel = c6.multiselect(
+                    "Índice de Reajuste", INDICES,
+                    default=parse_indices(r.get("Índice Reajuste", "")),
+                    max_selections=2, key=f"idx{r['Loja']}",
+                    help="Até 2 índices previstos em contrato. No menu Reajustes "
+                         "o cliente escolhe qual dos dois aplicar.")
 
                 venc_contr = c7.text_input("Vencimento do Contrato (dd/mm/aaaa)",
                                            value=str(r.get("Vencimento Contrato", "")))
@@ -654,7 +663,8 @@ def pagina_imoveis():
                     #        Vencimento Contrato, Observação
                     wl.update(f"B{cell.row}:K{cell.row}",
                               [[resp, aluguel, dia_vcto, dia_pgto, assinatura,
-                                debito, calcao, indice, venc_contr, obs]],
+                                debito, calcao, ", ".join(indices_sel),
+                                venc_contr, obs]],
                               value_input_option="USER_ENTERED")
                     st.success("Atualizado.")
                     st.rerun()
