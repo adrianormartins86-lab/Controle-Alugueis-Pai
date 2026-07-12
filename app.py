@@ -269,12 +269,44 @@ def pagina_painel():
                 txt + (f" (há {-dias} dias)" if dias < 0 else f" (em {dias} dias)"))
 
 
+@st.dialog("✅ Lançamento salvo")
+def modal_lancamento_ok(d: dict):
+    st.markdown(f"O lançamento foi gravado na planilha com sucesso.")
+    st.markdown(
+        f"""
+| | |
+|---|---|
+| **Imóvel** | {d['imovel']} |
+| **Dt Lcto** | {d['data']} |
+| **Referente** | {d['referente']} |
+| **Dt Vcto** | {d['vcto']} |
+| **R$ Valor Lcto** | {brl(d['valor_lcto'])} |
+| **R$ Total Pago** | {brl(d['total_pago'])} |
+| **Saldo do lançamento** | {brl(d['saldo'])} |
+"""
+    )
+    if d["saldo"] > 0.005:
+        st.warning(f"Ficou em aberto: {brl(d['saldo'])}")
+    elif d["saldo"] < -0.005:
+        st.info(f"Pagou a maior: {brl(-d['saldo'])}")
+    else:
+        st.success("Lançamento quitado. ✅")
+
+    if st.button("OK", type="primary", use_container_width=True):
+        st.session_state.pop("lcto_ok", None)
+        st.rerun()
+
+
 def pagina_lancamentos():
     st.subheader("➕ Lançamentos")
     lojas = ler("Lojas", H_LOJAS)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
+
+    # abre a janela de confirmação após o rerun do salvamento
+    if st.session_state.get("lcto_ok"):
+        modal_lancamento_ok(st.session_state["lcto_ok"])
 
     op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
 
@@ -320,7 +352,16 @@ def pagina_lancamentos():
                  dt_vcto.strftime("%d/%m/%Y"),
                  valor_lcto, valor_pago, multa, juros, cm],
                 value_input_option="USER_ENTERED")
-            st.success("Lançamento salvo na planilha.")
+            tot = valor_pago + multa + juros + cm
+            st.session_state["lcto_ok"] = {
+                "imovel": sel,
+                "data": data.strftime("%d/%m/%Y"),
+                "referente": referente or "—",
+                "vcto": dt_vcto.strftime("%d/%m/%Y"),
+                "valor_lcto": valor_lcto,
+                "total_pago": tot,
+                "saldo": valor_lcto - tot,
+            }
             st.rerun()
 
     st.divider()
