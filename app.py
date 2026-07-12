@@ -32,8 +32,9 @@ from google.oauth2.service_account import Credentials
 # ----------------------------------------------------------------------------- #
 # Estrutura das abas
 # ----------------------------------------------------------------------------- #
-H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Início Contrato",
-           "Saldo Inicial", "Multa %", "Juros % a.m.", "Próximo Reajuste", "Observação"]
+# Aba Lojas — colunas A..I
+H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Dia Pgto",
+           "Assinatura Contrato", "Saldo Inicial", "Vencimento Contrato", "Observação"]
 
 # Aba Pagamentos — colunas A..J
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
@@ -42,19 +43,18 @@ H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
 LOJAS_SEED = [
-    [1, "Produtos Naturais — Célia", 1100.00, 25, "", 4019.42, 2, 1, "25/06/2026",
-     "CONFIRMAR saldo (4.019,42): verificar se é dívida ou crédito."],
-    [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", 0, 2, 1, "25/05/2027",
+    [1, "Produtos Naturais -- Wilson Oliveira", 1100.00, 25, "", "", -4019.42, "25/06/2026",
+     "Saldo devedor: (-4.019,42) em 30/06/2026."],
+    [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", "", 0, "25/05/2027",
      "Sala relocada em 25/04/2026 (antes: Bruna)."],
-    [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", 1232.00, 2, 1, "01/08/2026",
-     "CONFIRMAR saldo (~980 + 252 multa). Refazer contrato 01/08/2026."],
-    [4, "Espetaria/Sorveteria — Rose Aguiar de Souza", 1270.30, 10, "", 0, 2, 1, "10/05/2027",
+    [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", "", 1232.00, "01/08/2026",
+     "Refazer contrato 01/08/2026."],
+    [4, "D2 - Espetaria - Everton Argos Leão", 1270.30, 10, "", "", 0, "10/05/2027",
      "Reajuste INCC 5,86% em 10/05/2026."],
-    [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", 0, 2, 1, "",
+    [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", "", 0, "",
      "Pagamentos em dia."],
-    [6, "Sala projetada (vaga)", 0, 1, "", 0, 2, 1, "", ""],
-    [7, "Apto. Florais — Allan e Amanda", 4000.00, 12, "", 0, 2, 1, "",
-     "CONFIRMAR: sem histórico na planilha."],
+    [6, "Sala projetada (vaga)", 0, 1, "", "", 0, "", ""],
+    [7, "Sala Disponível", 0, 12, "", "", 0, "", ""],
 ]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
@@ -257,13 +257,13 @@ def pagina_painel():
 
     avisos = []
     for _, r in lojas.iterrows():
-        d = to_date(r.get("Próximo Reajuste"))
+        d = to_date(r.get("Vencimento Contrato"))
         if d is not None and not pd.isna(d):
             dias = (d.date() - hoje).days
-            if dias <= 45:
+            if dias <= 60:
                 avisos.append((dias, r["Responsável"], d.date()))
     if avisos:
-        st.markdown("##### 📈 Reajustes a vencer")
+        st.markdown("##### 📄 Contratos a vencer")
         for dias, resp, d in sorted(avisos):
             txt = f"**{resp}** — {d.strftime('%d/%m/%Y')}"
             (st.warning if dias < 0 else st.info)(
@@ -376,8 +376,7 @@ def pagina_lancamentos():
 
     st.divider()
     with st.expander("🧮 Calculadora de multa / juros por atraso (opcional)"):
-        st.caption("Calcule o valor e depois digite no lançamento. "
-                   "Os % vêm do cadastro do imóvel.")
+        st.caption("Calcule o valor e depois digite nos campos Multa / Juros do lançamento.")
         selm = st.selectbox("Imóvel", list(op.keys()), key="mj")
         lr = lojas[lojas["Loja"] == op[selm]].iloc[0]
         m1, m2, m3 = st.columns(3)
@@ -388,10 +387,9 @@ def pagina_lancamentos():
         pgto = m3.date_input("Pagamento", value=dt.date.today(),
                              format="DD/MM/YYYY", key="mjp")
         m4, m5 = st.columns(2)
-        mpct = m4.number_input("Multa %", min_value=0.0, value=num(lr["Multa %"]) or 2.0,
+        mpct = m4.number_input("Multa %", min_value=0.0, value=2.0,
                                step=0.5, format="%.2f", key="mjm")
-        jpct = m5.number_input("Juros % a.m.", min_value=0.0,
-                               value=num(lr["Juros % a.m."]) or 1.0,
+        jpct = m5.number_input("Juros % a.m.", min_value=0.0, value=1.0,
                                step=0.5, format="%.2f", key="mjj")
         dias = max((pgto - venc).days, 0)
         mv = round(base * mpct / 100, 2)
@@ -564,9 +562,7 @@ def pagina_reajustes():
                     value_input_option="USER_ENTERED")
                 wl = ws("Lojas")
                 cell = wl.find(str(op[sel]), in_column=1)
-                wl.update_cell(cell.row, 3, novo)
-                wl.update_cell(cell.row, 9,
-                               (data + dt.timedelta(days=365)).strftime("%d/%m/%Y"))
+                wl.update_cell(cell.row, 3, novo)   # coluna C = Aluguel Atual
                 st.success(f"Reajuste aplicado: {brl(atual)} → {brl(novo)}.")
                 st.rerun()
 
@@ -608,25 +604,35 @@ def pagina_imoveis():
                 resp = c1.text_input("Responsável", value=str(r["Responsável"]))
                 aluguel = c2.number_input("Aluguel atual", value=num(r["Aluguel Atual"]),
                                           step=50.0, format="%.2f")
+
                 c3, c4, c5 = st.columns(3)
-                dia = c3.number_input("Dia vcto", min_value=1, max_value=31,
-                                      value=int(num(r["Dia Vcto"]) or 1))
-                sini = c4.number_input("Saldo inicial", value=num(r["Saldo Inicial"]),
-                                       step=50.0, format="%.2f")
-                prox = c5.text_input("Próximo reajuste (dd/mm/aaaa)",
-                                     value=str(r.get("Próximo Reajuste", "")))
+                dia_vcto = c3.number_input("Dia Vcto", min_value=1, max_value=31,
+                                           value=int(num(r["Dia Vcto"]) or 1),
+                                           help="Dia do vencimento do aluguel.")
+                dia_pgto = c4.number_input("Dia Pgto", min_value=0, max_value=31,
+                                           value=int(num(r.get("Dia Pgto", 0)) or 0),
+                                           help="Dia em que o inquilino costuma pagar. "
+                                                "0 = não informado.")
+                saldo_ini = c5.number_input("Saldo inicial", value=num(r["Saldo Inicial"]),
+                                            step=50.0, format="%.2f",
+                                            help="Positivo = devedor · Negativo = crédito.")
+
                 c6, c7 = st.columns(2)
-                mpct = c6.number_input("Multa %", value=num(r["Multa %"]) or 2.0, step=0.5)
-                jpct = c7.number_input("Juros % a.m.", value=num(r["Juros % a.m."]) or 1.0,
-                                       step=0.5)
+                assinatura = c6.text_input("Data Assinatura Contrato (dd/mm/aaaa)",
+                                           value=str(r.get("Assinatura Contrato", "")))
+                venc_contr = c7.text_input("Vencimento do Contrato (dd/mm/aaaa)",
+                                           value=str(r.get("Vencimento Contrato", "")))
+
                 obs = st.text_area("Observação", value=str(r.get("Observação", "")))
 
                 if st.form_submit_button("💾 Salvar", type="primary"):
                     wl = ws("Lojas")
                     cell = wl.find(str(r["Loja"]), in_column=1)
-                    wl.update(f"B{cell.row}:J{cell.row}",
-                              [[resp, aluguel, dia, str(r.get("Início Contrato", "")),
-                                sini, mpct, jpct, prox, obs]],
+                    # B..I = Responsável, Aluguel Atual, Dia Vcto, Dia Pgto,
+                    #        Assinatura Contrato, Saldo Inicial, Vencimento Contrato, Observação
+                    wl.update(f"B{cell.row}:I{cell.row}",
+                              [[resp, aluguel, dia_vcto, dia_pgto, assinatura,
+                                saldo_ini, venc_contr, obs]],
                               value_input_option="USER_ENTERED")
                     st.success("Atualizado.")
                     st.rerun()
