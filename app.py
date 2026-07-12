@@ -32,9 +32,12 @@ from google.oauth2.service_account import Credentials
 # ----------------------------------------------------------------------------- #
 # Estrutura das abas
 # ----------------------------------------------------------------------------- #
-# Aba Lojas — colunas A..I
+# Aba Lojas — colunas A..K
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Dia Pgto",
-           "Assinatura Contrato", "Saldo Inicial", "Vencimento Contrato", "Observação"]
+           "Assinatura Contrato", "Débito Geral", "Caução", "Índice Reajuste",
+           "Vencimento Contrato", "Observação"]
+
+INDICES = ["", "IGP-M", "IGP-DI", "IPCA", "INCC-DI"]
 
 # Aba Pagamentos — colunas A..J
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
@@ -43,18 +46,18 @@ H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
 LOJAS_SEED = [
-    [1, "Produtos Naturais -- Wilson Oliveira", 1100.00, 25, "", "", -4019.42, "25/06/2026",
-     "Saldo devedor: (-4.019,42) em 30/06/2026."],
-    [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", "", 0, "25/05/2027",
-     "Sala relocada em 25/04/2026 (antes: Bruna)."],
-    [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", "", 1232.00, "01/08/2026",
-     "Refazer contrato 01/08/2026."],
-    [4, "D2 - Espetaria - Everton Argos Leão", 1270.30, 10, "", "", 0, "10/05/2027",
-     "Reajuste INCC 5,86% em 10/05/2026."],
-    [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", "", 0, "",
-     "Pagamentos em dia."],
-    [6, "Sala projetada (vaga)", 0, 1, "", "", 0, "", ""],
-    [7, "Sala Disponível", 0, 12, "", "", 0, "", ""],
+    [1, "Produtos Naturais -- Wilson Oliveira", 1100.00, 25, "", "", -4019.42, 0, "IGP-M",
+     "25/06/2026", "Saldo devedor: (-4.019,42) em 30/06/2026."],
+    [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", "", 0, 0, "IGP-M",
+     "25/05/2027", "Sala relocada em 25/04/2026 (antes: Bruna)."],
+    [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", "", 1232.00, 0, "IGP-M",
+     "01/08/2026", "Refazer contrato 01/08/2026."],
+    [4, "D2 - Espetaria - Everton Argos Leão", 1270.30, 10, "", "", 0, 0, "INCC-DI",
+     "10/05/2027", "Reajuste INCC 5,86% em 10/05/2026."],
+    [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", "", 0, 0, "IGP-M",
+     "", "Pagamentos em dia."],
+    [6, "Sala projetada (vaga)", 0, 1, "", "", 0, 0, "", "", ""],
+    [7, "Sala Disponível", 0, 12, "", "", 0, 0, "", "", ""],
 ]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
@@ -182,11 +185,11 @@ def total_pago(r) -> float:
 # Cálculo de saldo
 # ----------------------------------------------------------------------------- #
 def saldo_loja(loja_id, lojas: pd.DataFrame, pags: pd.DataFrame) -> float:
-    """Saldo Inicial + Σ Valor Lcto − Σ Total Pago. Positivo = devedor."""
+    """Débito Geral + Σ Valor Lcto − Σ Total Pago. Positivo = devedor."""
     base = 0.0
     linha = lojas[lojas["Loja"].astype(str) == str(loja_id)]
     if not linha.empty:
-        base = num(linha.iloc[0]["Saldo Inicial"])
+        base = num(linha.iloc[0]["Débito Geral"])
     if pags.empty:
         return base
     p = pags[pags["Loja"].astype(str) == str(loja_id)]
@@ -433,7 +436,7 @@ def pagina_extrato():
     loja_id = op[sel]
     lr = lojas[lojas["Loja"] == loja_id].iloc[0]
 
-    saldo_inicial = num(lr["Saldo Inicial"])
+    saldo_inicial = num(lr["Débito Geral"])
     p = (pags[pags["Loja"].astype(str) == str(loja_id)].copy()
          if not pags.empty else pd.DataFrame())
 
@@ -463,7 +466,7 @@ def pagina_extrato():
             })
 
     if saldo_inicial:
-        st.caption(f"Saldo inicial (cadastro do imóvel): **{brl(saldo_inicial)}**")
+        st.caption(f"Débito geral (cadastro do imóvel): **{brl(saldo_inicial)}**")
 
     modo_edicao = st.toggle("🗑️ Habilitar exclusão de lançamentos", value=False,
                             key="ext_edit",
@@ -546,7 +549,11 @@ def pagina_reajustes():
         lr = lojas[lojas["Loja"] == op[sel]].iloc[0]
         c1, c2, c3 = st.columns(3)
         data = c1.date_input("Data", value=dt.date.today(), format="DD/MM/YYYY")
-        indice = c2.selectbox("Índice", ["IGP-M", "IPCA", "INCC", "IGP-DI", "Outro"])
+        opcoes_idx = [i for i in INDICES if i]
+        idx_cad = str(lr.get("Índice Reajuste", "")).strip()
+        pos = opcoes_idx.index(idx_cad) if idx_cad in opcoes_idx else 0
+        indice = c2.selectbox("Índice", opcoes_idx, index=pos,
+                              help="Sugerido pelo cadastro do imóvel.")
         perc = c3.number_input("Reajuste (%)", value=0.0, step=0.5, format="%.2f")
 
         atual = num(lr["Aluguel Atual"])
@@ -605,7 +612,7 @@ def pagina_imoveis():
                 aluguel = c2.number_input("Aluguel atual", value=num(r["Aluguel Atual"]),
                                           step=50.0, format="%.2f")
 
-                c3, c4, c5 = st.columns(3)
+                c3, c4 = st.columns(2)
                 dia_vcto = c3.number_input("Dia Vcto", min_value=1, max_value=31,
                                            value=int(num(r["Dia Vcto"]) or 1),
                                            help="Dia do vencimento do aluguel.")
@@ -613,26 +620,41 @@ def pagina_imoveis():
                                            value=int(num(r.get("Dia Pgto", 0)) or 0),
                                            help="Dia em que o inquilino costuma pagar. "
                                                 "0 = não informado.")
-                saldo_ini = c5.number_input("Saldo inicial", value=num(r["Saldo Inicial"]),
-                                            step=50.0, format="%.2f",
-                                            help="Positivo = devedor · Negativo = crédito.")
 
-                c6, c7 = st.columns(2)
-                assinatura = c6.text_input("Data Assinatura Contrato (dd/mm/aaaa)",
+                c5, c6, c7 = st.columns(3)
+                assinatura = c5.text_input("Data Assinatura Contrato (dd/mm/aaaa)",
                                            value=str(r.get("Assinatura Contrato", "")))
+
+                idx_atual = str(r.get("Índice Reajuste", "")).strip()
+                pos = INDICES.index(idx_atual) if idx_atual in INDICES else 0
+                indice = c6.selectbox("Índice de Reajuste", INDICES, index=pos,
+                                      key=f"idx{r['Loja']}",
+                                      help="Índice previsto em contrato.")
+
                 venc_contr = c7.text_input("Vencimento do Contrato (dd/mm/aaaa)",
                                            value=str(r.get("Vencimento Contrato", "")))
+
+                c8, c9 = st.columns(2)
+                debito = c8.number_input("Débito Geral", value=num(r["Débito Geral"]),
+                                         step=50.0, format="%.2f",
+                                         help="Positivo = devedor · Negativo = crédito. "
+                                              "É o ponto de partida do extrato.")
+                calcao = c9.number_input("Caução", min_value=0.0,
+                                         value=num(r.get("Caução", 0)),
+                                         step=50.0, format="%.2f",
+                                         help="Valor do depósito de garantia (caução).")
 
                 obs = st.text_area("Observação", value=str(r.get("Observação", "")))
 
                 if st.form_submit_button("💾 Salvar", type="primary"):
                     wl = ws("Lojas")
                     cell = wl.find(str(r["Loja"]), in_column=1)
-                    # B..I = Responsável, Aluguel Atual, Dia Vcto, Dia Pgto,
-                    #        Assinatura Contrato, Saldo Inicial, Vencimento Contrato, Observação
-                    wl.update(f"B{cell.row}:I{cell.row}",
+                    # B..K = Responsável, Aluguel Atual, Dia Vcto, Dia Pgto,
+                    #        Assinatura Contrato, Débito Geral, Caução, Índice Reajuste,
+                    #        Vencimento Contrato, Observação
+                    wl.update(f"B{cell.row}:K{cell.row}",
                               [[resp, aluguel, dia_vcto, dia_pgto, assinatura,
-                                saldo_ini, venc_contr, obs]],
+                                debito, calcao, indice, venc_contr, obs]],
                               value_input_option="USER_ENTERED")
                     st.success("Atualizado.")
                     st.rerun()
