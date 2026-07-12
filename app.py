@@ -7,8 +7,8 @@ então a planilha guarda apenas os campos que o usuário digita.
 
 Configuração (Streamlit secrets):
     app_password = "sua_senha"
-    sheet_key = "ID_DA_PLANILHA"          # parte do meio da URL da planilha
-    [gcp_service_account]                  # JSON da conta de serviço (campos a campo)
+    sheet_key    = "ID_DA_PLANILHA"   # parte do meio da URL da planilha
+    [gcp_service_account]             # JSON da conta de serviço (campos a campo)
     type = "service_account"
     project_id = "..."
     private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
@@ -17,6 +17,7 @@ Configuração (Streamlit secrets):
 """
 
 from __future__ import annotations
+
 import datetime as dt
 
 import pandas as pd
@@ -69,6 +70,7 @@ def get_spreadsheet():
 def garantir_estrutura(sh):
     """Cria as abas e cabeçalhos que faltarem; cadastra os 7 imóveis se vazio."""
     titulos = {ws.title: ws for ws in sh.worksheets()}
+
     def garante(nome, header, ncols):
         if nome in titulos:
             ws = titulos[nome]
@@ -78,9 +80,11 @@ def garantir_estrutura(sh):
         if atual[:len(header)] != header:
             ws.update("A1", [header])
         return ws
+
     ws_lojas = garante("Lojas", H_LOJAS, len(H_LOJAS))
     garante("Pagamentos", H_PAG, len(H_PAG))
     garante("Reajustes", H_REAJ, len(H_REAJ))
+
     # seed de Lojas se só tiver cabeçalho
     if len(ws_lojas.get_all_values()) <= 1:
         ws_lojas.update("A2", LOJAS_SEED, value_input_option="USER_ENTERED")
@@ -90,23 +94,46 @@ def ws(nome):
     return get_spreadsheet().worksheet(nome)
 
 
-def ler(nome, headers) -> pd.DataFrame:
+def ler(nome, headers, com_linha: bool = False) -> pd.DataFrame:
     """Lê a aba pegando só as colunas conhecidas (pela 1ª ocorrência do nome).
-    Ignora colunas extras ou cabeçalhos repetidos, evitando erros de duplicata."""
+
+    Ignora colunas extras ou cabeçalhos repetidos, evitando erros de duplicata.
+    Se com_linha=True, devolve também a coluna '__linha' com o número REAL da
+    linha na planilha (usada para excluir/atualizar registros com segurança).
+    """
     vals = ws(nome).get_all_values()
     if not vals:
-        return pd.DataFrame(columns=headers)
+        cols = list(headers) + (["__linha"] if com_linha else [])
+        return pd.DataFrame(columns=cols)
+
     head = vals[0]
     width = len(head)
-    linhas = [list(r)[:width] + [""] * (width - len(r)) for r in vals[1:]]
+
+    linhas, numeros = [], []
+    for i, r in enumerate(vals[1:], start=2):   # linha 1 = cabeçalho
+        linhas.append(list(r)[:width] + [""] * (width - len(r)))
+        numeros.append(i)
+
     base = pd.DataFrame(linhas, columns=[f"__c{i}" for i in range(width)])
+
     out = {}
     for h in headers:
         out[h] = base[f"__c{head.index(h)}"] if h in head else ""
-    df = pd.DataFrame(out)
+    df = pd.DataFrame(out, index=base.index)
+    df["__linha"] = numeros
+
     if headers and headers[0] in df.columns and not df.empty:
         df = df[df[headers[0]].astype(str).str.strip() != ""]
-    return df.reset_index(drop=True)
+
+    df = df.reset_index(drop=True)
+    if not com_linha:
+        df = df.drop(columns=["__linha"])
+    return df
+
+
+def excluir_linha(aba: str, linha: int):
+    """Exclui uma linha física da aba informada."""
+    ws(aba).delete_rows(int(linha))
 
 
 # ----------------------------------------------------------------------------- #
@@ -191,6 +218,7 @@ def pagina_dashboard():
 
     hoje = dt.date.today()
     mes_atual = hoje.strftime("%Y-%m")
+
     recebido_mes = 0.0
     if not pags.empty:
         for _, r in pags.iterrows():
@@ -242,26 +270,32 @@ def pagina_lancamentos():
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
+
     op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
 
     with st.form("novo", clear_on_submit=True):
         st.markdown("**Novo lançamento**")
         sel = st.selectbox("Imóvel", list(op.keys()))
         loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
+
         c1, c2, c3 = st.columns(3)
         comp = c1.text_input("Competência (mês)", value=dt.date.today().strftime("%m/%Y"))
         data = c2.date_input("Data do pagamento", value=dt.date.today(), format="DD/MM/YYYY")
         aluguel = c3.number_input("Aluguel devido", min_value=0.0,
                                   value=num(loja_row["Aluguel Atual"]), step=50.0, format="%.2f")
+
         c4, c5, c6 = st.columns(3)
         iptu = c4.number_input("IPTU / Taxa", min_value=0.0, step=10.0, format="%.2f")
         multa = c5.number_input("Multa / Juros", min_value=0.0, step=10.0, format="%.2f")
         pago = c6.number_input("Valor pago", min_value=0.0, step=50.0, format="%.2f")
+
         c7, c8 = st.columns(2)
         produtos = c7.number_input("Pago em produtos", min_value=0.0, step=10.0, format="%.2f")
         obs = c8.text_input("Observação")
+
         st.caption("Dica: lance o **Aluguel devido** uma vez por mês. Em pagamentos extras "
                    "do mesmo mês, deixe o aluguel = 0 para não duplicar a cobrança.")
+
         if st.form_submit_button("Lançar", type="primary"):
             ws("Pagamentos").append_row(
                 [op[sel], comp, data.strftime("%d/%m/%Y"), aluguel, iptu, multa,
@@ -298,40 +332,46 @@ def pagina_lancamentos():
 
     st.divider()
     st.markdown("**Últimos lançamentos**")
-    pags = ler("Pagamentos", H_PAG)
+    pags = ler("Pagamentos", H_PAG, com_linha=True)
     if pags.empty:
         st.info("Sem lançamentos ainda.")
         return
+
     nomes = {r["Loja"]: r["Responsável"] for _, r in lojas.iterrows()}
-    pags = pags.reset_index()  # index 0-based; linha real = index+2
     for _, r in pags.tail(15).iloc[::-1].iterrows():
-        linha_planilha = int(r["index"]) + 2
+        linha_planilha = int(r["__linha"])
         c1, c2 = st.columns([6, 1])
         c1.write(f'**{r.get("Data Pagamento","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
                  f'devido {brl(num(r["Aluguel Devido"]))} · pago {brl(num(r["Valor Pago"]))}'
                  + (f' · _{r["Observação"]}_' if r.get("Observação") else ""))
-        if c2.button("🗑️", key=f"d{linha_planilha}"):
-            ws("Pagamentos").delete_rows(linha_planilha)
+        if c2.button("🗑️", key=f"dl{linha_planilha}"):
+            excluir_linha("Pagamentos", linha_planilha)
             st.rerun()
 
 
 def pagina_extrato():
     st.subheader("📄 Extrato por imóvel")
-    lojas, pags = ler("Lojas", H_LOJAS), ler("Pagamentos", H_PAG)
+    lojas = ler("Lojas", H_LOJAS)
+    pags = ler("Pagamentos", H_PAG, com_linha=True)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
+
     op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
     sel = st.selectbox("Imóvel", list(op.keys()))
     loja_id = op[sel]
     lr = lojas[lojas["Loja"] == loja_id].iloc[0]
-    saldo = num(lr["Saldo Inicial"])
 
-    p = pags[pags["Loja"].astype(str) == str(loja_id)].copy() if not pags.empty else pd.DataFrame()
+    saldo = num(lr["Saldo Inicial"])
+    p = (pags[pags["Loja"].astype(str) == str(loja_id)].copy()
+         if not pags.empty else pd.DataFrame())
+
+    # ---- monta as linhas do extrato (com o saldo acumulado) ------------------ #
     linhas = []
     if saldo:
         linhas.append({"Data": "—", "Lançamento": "Saldo inicial", "Cobrança": "",
-                       "Recebido": "", "Saldo": brl(saldo)})
+                       "Recebido": "", "Saldo": brl(saldo), "__linha": None})
+
     if not p.empty:
         p["__d"] = p["Data Pagamento"].apply(to_date)
         p = p.sort_values("__d", na_position="last")
@@ -342,8 +382,64 @@ def pagina_extrato():
             linhas.append({"Data": r.get("Data Pagamento", ""),
                            "Lançamento": r.get("Observação", "") or "Movimentação",
                            "Cobrança": brl(cob) if cob else "",
-                           "Recebido": brl(rec) if rec else "", "Saldo": brl(saldo)})
-    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+                           "Recebido": brl(rec) if rec else "",
+                           "Saldo": brl(saldo),
+                           "__linha": int(r["__linha"])})
+
+    modo_edicao = st.toggle("🗑️ Habilitar exclusão de lançamentos", value=False,
+                            key="ext_edit",
+                            help="Ative para mostrar o botão de excluir em cada linha. "
+                                 "A exclusão remove o registro da planilha (aba Pagamentos).")
+
+    # ---- renderiza a tabela -------------------------------------------------- #
+    if not linhas:
+        st.info("Nenhum lançamento para este imóvel.")
+    elif not modo_edicao:
+        st.dataframe(pd.DataFrame(linhas).drop(columns=["__linha"]),
+                     use_container_width=True, hide_index=True)
+    else:
+        larguras = [1.2, 2.6, 1.3, 1.3, 1.4, 0.9]
+        h = st.columns(larguras)
+        for col, titulo in zip(h, ["Data", "Lançamento", "Cobrança", "Recebido",
+                                   "Saldo", "Ação"]):
+            col.markdown(f"**{titulo}**")
+        st.markdown("<hr style='margin:2px 0 8px 0'>", unsafe_allow_html=True)
+
+        alvo = st.session_state.get("ext_confirm")
+
+        for item in linhas:
+            c = st.columns(larguras)
+            c[0].write(item["Data"])
+            c[1].write(item["Lançamento"])
+            c[2].write(item["Cobrança"] or "—")
+            c[3].write(item["Recebido"] or "—")
+            c[4].write(item["Saldo"])
+
+            linha_planilha = item["__linha"]
+            if linha_planilha is None:
+                c[5].caption("—")   # saldo inicial: edite na aba Imóveis
+                continue
+
+            if alvo == linha_planilha:
+                b1, b2 = c[5].columns(2)
+                if b1.button("✅", key=f"ok{linha_planilha}", help="Confirmar exclusão"):
+                    excluir_linha("Pagamentos", linha_planilha)
+                    st.session_state.pop("ext_confirm", None)
+                    st.toast("Lançamento excluído.", icon="🗑️")
+                    st.rerun()
+                if b2.button("↩️", key=f"no{linha_planilha}", help="Cancelar"):
+                    st.session_state.pop("ext_confirm", None)
+                    st.rerun()
+            else:
+                if c[5].button("🗑️", key=f"ex{linha_planilha}", help="Excluir lançamento"):
+                    st.session_state["ext_confirm"] = linha_planilha
+                    st.rerun()
+
+        if alvo is not None:
+            st.warning("Clique em ✅ para confirmar a exclusão ou ↩️ para cancelar. "
+                       "A ação não pode ser desfeita.")
+
+    st.divider()
     if saldo > 0.005:
         st.error(f"Saldo devedor atual: **{brl(saldo)}**")
     elif saldo < -0.005:
@@ -358,7 +454,9 @@ def pagina_reajustes():
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
+
     op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
+
     with st.form("reaj", clear_on_submit=True):
         sel = st.selectbox("Imóvel", list(op.keys()))
         lr = lojas[lojas["Loja"] == op[sel]].iloc[0]
@@ -366,9 +464,11 @@ def pagina_reajustes():
         data = c1.date_input("Data", value=dt.date.today(), format="DD/MM/YYYY")
         indice = c2.selectbox("Índice", ["IGP-M", "IPCA", "INCC", "IGP-DI", "Outro"])
         perc = c3.number_input("Reajuste (%)", value=0.0, step=0.5, format="%.2f")
+
         atual = num(lr["Aluguel Atual"])
         novo = round(atual * (1 + perc / 100), 2)
         st.write(f"Atual: **{brl(atual)}** → Novo: **{brl(novo)}**")
+
         if st.form_submit_button("Aplicar reajuste", type="primary"):
             if perc == 0:
                 st.warning("Informe um percentual.")
@@ -383,13 +483,30 @@ def pagina_reajustes():
                 wl.update_cell(cell.row, 9, (data + dt.timedelta(days=365)).strftime("%d/%m/%Y"))
                 st.success(f"Reajuste aplicado: {brl(atual)} → {brl(novo)}.")
                 st.rerun()
+
     st.divider()
     st.markdown("**Histórico**")
-    dfr = ler("Reajustes", H_REAJ)
+    dfr = ler("Reajustes", H_REAJ, com_linha=True)
     if dfr.empty:
         st.info("Nenhum reajuste registrado.")
-    else:
-        st.dataframe(dfr, use_container_width=True, hide_index=True)
+        return
+
+    st.dataframe(dfr.drop(columns=["__linha"]), use_container_width=True, hide_index=True)
+
+    with st.expander("🗑️ Excluir um reajuste do histórico"):
+        st.caption("Excluir aqui remove apenas o registro do histórico. "
+                   "O 'Aluguel Atual' do imóvel NÃO volta ao valor anterior — "
+                   "se precisar, ajuste na aba Imóveis.")
+        rot = {f'linha {int(r["__linha"])} · {r["Loja"]} · {r["Data"]} · '
+               f'{r["Índice"]} {r["%"]}% · {brl(num(r["Valor Anterior"]))} → '
+               f'{brl(num(r["Valor Novo"]))}': int(r["__linha"])
+               for _, r in dfr.iterrows()}
+        escolha = st.selectbox("Registro", list(rot.keys()), key="rej_del")
+        confirmar = st.checkbox("Confirmo a exclusão", key="rej_ok")
+        if st.button("Excluir reajuste", type="primary", disabled=not confirmar):
+            excluir_linha("Reajustes", rot[escolha])
+            st.toast("Reajuste excluído.", icon="🗑️")
+            st.rerun()
 
 
 def pagina_imoveis():
@@ -398,6 +515,7 @@ def pagina_imoveis():
     if lojas.empty:
         st.info("Nenhum imóvel cadastrado.")
         return
+
     for _, r in lojas.iterrows():
         with st.expander(f'{r["Loja"]} — {r["Responsável"]}'):
             with st.form(f'e{r["Loja"]}'):
@@ -416,6 +534,7 @@ def pagina_imoveis():
                 mpct = c6.number_input("Multa %", value=num(r["Multa %"]) or 2.0, step=0.5)
                 jpct = c7.number_input("Juros % a.m.", value=num(r["Juros % a.m."]) or 1.0, step=0.5)
                 obs = st.text_area("Observação", value=str(r.get("Observação", "")))
+
                 if st.form_submit_button("💾 Salvar", type="primary"):
                     wl = ws("Lojas")
                     cell = wl.find(str(r["Loja"]), in_column=1)
@@ -434,6 +553,7 @@ def main():
     st.set_page_config(page_title="Gestão de Aluguéis", page_icon="🏠", layout="wide")
     if not checar_senha():
         return
+
     st.sidebar.title("🏠 Gestão de Aluguéis")
     pag = st.sidebar.radio("Menu", ["Dashboard", "Lançamentos", "Extrato",
                                     "Reajustes", "Imóveis"])
