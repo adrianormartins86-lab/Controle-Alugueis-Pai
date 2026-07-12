@@ -2,17 +2,21 @@
 Gestão de Aluguéis — versão com Google Sheets como banco de dados.
 
 Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
-O app lê/escreve via gspread (conta de serviço). O saldo é calculado em Python,
-então a planilha guarda apenas os campos que o usuário digita.
+O app lê/escreve via gspread (conta de serviço). Os cálculos são feitos em
+Python, então a planilha guarda apenas os campos que o usuário digita.
+
+Modelo de lançamento (aba Pagamentos):
+    Valor Lcto     -> quanto foi lançado/cobrado (aluguel, IPTU, taxa, o que for)
+    Valor Pago     -> quanto o inquilino pagou referente ao lançamento
+    Multa/Juros/CM -> valores em R$ pagos a mais (digitados manualmente)
+    Total Pago     = Valor Pago + Multa + Juros + CM      (calculado)
+    Saldo Devedor  = Valor Lcto - Total Pago              (calculado)
 
 Configuração (Streamlit secrets):
     app_password = "sua_senha"
-    sheet_key    = "ID_DA_PLANILHA"   # parte do meio da URL da planilha
-    [gcp_service_account]             # JSON da conta de serviço (campos a campo)
+    sheet_key    = "ID_DA_PLANILHA"
+    [gcp_service_account]
     type = "service_account"
-    project_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-    client_email = "...@...iam.gserviceaccount.com"
     ...
 """
 
@@ -30,8 +34,11 @@ from google.oauth2.service_account import Credentials
 # ----------------------------------------------------------------------------- #
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Início Contrato",
            "Saldo Inicial", "Multa %", "Juros % a.m.", "Próximo Reajuste", "Observação"]
-H_PAG = ["Loja", "Competência", "Data Pagamento", "Aluguel Devido", "IPTU/Taxa",
-         "Multa/Juros", "Valor Pago", "Pago em Produtos", "Observação"]
+
+# NOVO layout da aba Pagamentos (colunas A..I)
+H_PAG = ["Loja", "Competência", "Dt Lcto", "Referente", "Valor Lcto",
+         "Valor Pago", "Multa", "Juros", "CM"]
+
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
 LOJAS_SEED = [
@@ -85,7 +92,6 @@ def garantir_estrutura(sh):
     garante("Pagamentos", H_PAG, len(H_PAG))
     garante("Reajustes", H_REAJ, len(H_REAJ))
 
-    # seed de Lojas se só tiver cabeçalho
     if len(ws_lojas.get_all_values()) <= 1:
         ws_lojas.update("A2", LOJAS_SEED, value_input_option="USER_ENTERED")
 
@@ -97,9 +103,8 @@ def ws(nome):
 def ler(nome, headers, com_linha: bool = False) -> pd.DataFrame:
     """Lê a aba pegando só as colunas conhecidas (pela 1ª ocorrência do nome).
 
-    Ignora colunas extras ou cabeçalhos repetidos, evitando erros de duplicata.
-    Se com_linha=True, devolve também a coluna '__linha' com o número REAL da
-    linha na planilha (usada para excluir/atualizar registros com segurança).
+    Se com_linha=True, devolve também '__linha' com o número REAL da linha na
+    planilha (usada para excluir registros com segurança).
     """
     vals = ws(nome).get_all_values()
     if not vals:
@@ -132,7 +137,6 @@ def ler(nome, headers, com_linha: bool = False) -> pd.DataFrame:
 
 
 def excluir_linha(aba: str, linha: int):
-    """Exclui uma linha física da aba informada."""
     ws(aba).delete_rows(int(linha))
 
 
@@ -148,7 +152,6 @@ def brl(v) -> str:
 
 
 def num(v) -> float:
-    """Converte célula (que pode vir como '1.100,00' ou 1100) em float."""
     if v is None or v == "":
         return 0.0
     if isinstance(v, (int, float)):
@@ -170,10 +173,16 @@ def to_date(v):
     return pd.to_datetime(v, dayfirst=True, errors="coerce")
 
 
+def total_pago(r) -> float:
+    """Total Pago = Valor Pago + Multa + Juros + CM."""
+    return num(r["Valor Pago"]) + num(r["Multa"]) + num(r["Juros"]) + num(r["CM"])
+
+
 # ----------------------------------------------------------------------------- #
-# Cálculo de saldo (em Python)
+# Cálculo de saldo
 # ----------------------------------------------------------------------------- #
 def saldo_loja(loja_id, lojas: pd.DataFrame, pags: pd.DataFrame) -> float:
+    """Saldo Inicial + Σ Valor Lcto − Σ Total Pago. Positivo = devedor."""
     base = 0.0
     linha = lojas[lojas["Loja"].astype(str) == str(loja_id)]
     if not linha.empty:
@@ -181,11 +190,9 @@ def saldo_loja(loja_id, lojas: pd.DataFrame, pags: pd.DataFrame) -> float:
     if pags.empty:
         return base
     p = pags[pags["Loja"].astype(str) == str(loja_id)]
-    cobr = sum(num(r["Aluguel Devido"]) + num(r["IPTU/Taxa"]) + num(r["Multa/Juros"])
-               for _, r in p.iterrows())
-    receb = sum(num(r["Valor Pago"]) + num(r["Pago em Produtos"])
-                for _, r in p.iterrows())
-    return base + cobr - receb
+    lancado = sum(num(r["Valor Lcto"]) for _, r in p.iterrows())
+    pago = sum(total_pago(r) for _, r in p.iterrows())
+    return base + lancado - pago
 
 
 # ----------------------------------------------------------------------------- #
@@ -222,9 +229,9 @@ def pagina_dashboard():
     recebido_mes = 0.0
     if not pags.empty:
         for _, r in pags.iterrows():
-            d = to_date(r.get("Data Pagamento"))
+            d = to_date(r.get("Dt Lcto"))
             if d is not None and not pd.isna(d) and d.strftime("%Y-%m") == mes_atual:
-                recebido_mes += num(r["Valor Pago"]) + num(r["Pago em Produtos"])
+                recebido_mes += total_pago(r)
 
     saldos = {r["Loja"]: saldo_loja(r["Loja"], lojas, pags) for _, r in lojas.iterrows()}
     total_pend = sum(v for v in saldos.values() if v > 0.005)
@@ -248,7 +255,6 @@ def pagina_dashboard():
                     "Situação": sit})
     st.dataframe(pd.DataFrame(tab), use_container_width=True, hide_index=True)
 
-    # Reajustes próximos (até 45 dias)
     avisos = []
     for _, r in lojas.iterrows():
         d = to_date(r.get("Próximo Reajuste"))
@@ -280,55 +286,60 @@ def pagina_lancamentos():
 
         c1, c2, c3 = st.columns(3)
         comp = c1.text_input("Competência (mês)", value=dt.date.today().strftime("%m/%Y"))
-        data = c2.date_input("Data do pagamento", value=dt.date.today(), format="DD/MM/YYYY")
-        aluguel = c3.number_input("Aluguel devido", min_value=0.0,
-                                  value=num(loja_row["Aluguel Atual"]), step=50.0, format="%.2f")
+        data = c2.date_input("Dt Lcto", value=dt.date.today(), format="DD/MM/YYYY")
+        referente = c3.text_input("Referente", value="Aluguel",
+                                  help="Digite livremente: Aluguel, IPTU, Multa, Acordo...")
 
-        c4, c5, c6 = st.columns(3)
-        iptu = c4.number_input("IPTU / Taxa", min_value=0.0, step=10.0, format="%.2f")
-        multa = c5.number_input("Multa / Juros", min_value=0.0, step=10.0, format="%.2f")
-        pago = c6.number_input("Valor pago", min_value=0.0, step=50.0, format="%.2f")
+        c4, c5 = st.columns(2)
+        valor_lcto = c4.number_input("R$ Valor Lcto", min_value=0.0,
+                                     value=num(loja_row["Aluguel Atual"]),
+                                     step=50.0, format="%.2f",
+                                     help="Quanto foi cobrado/lançado.")
+        valor_pago = c5.number_input("R$ Valor Pago", min_value=0.0, step=50.0, format="%.2f",
+                                     help="Quanto foi pago referente a este lançamento.")
 
-        c7, c8 = st.columns(2)
-        produtos = c7.number_input("Pago em produtos", min_value=0.0, step=10.0, format="%.2f")
-        obs = c8.text_input("Observação")
+        c6, c7, c8 = st.columns(3)
+        multa = c6.number_input("R$ Multa", min_value=0.0, step=10.0, format="%.2f")
+        juros = c7.number_input("R$ Juros", min_value=0.0, step=10.0, format="%.2f")
+        cm = c8.number_input("R$ CM (correção monetária)", min_value=0.0,
+                             step=10.0, format="%.2f")
 
-        st.caption("Dica: lance o **Aluguel devido** uma vez por mês. Em pagamentos extras "
-                   "do mesmo mês, deixe o aluguel = 0 para não duplicar a cobrança.")
+        st.caption("R$ Total Pago = Valor Pago + Multa + Juros + CM  ·  "
+                   "Saldo Devedor = Valor Lcto − Total Pago")
 
         if st.form_submit_button("Lançar", type="primary"):
             ws("Pagamentos").append_row(
-                [op[sel], comp, data.strftime("%d/%m/%Y"), aluguel, iptu, multa,
-                 pago, produtos, obs],
+                [op[sel], comp, data.strftime("%d/%m/%Y"), referente,
+                 valor_lcto, valor_pago, multa, juros, cm],
                 value_input_option="USER_ENTERED")
             st.success("Lançamento salvo na planilha.")
             st.rerun()
 
     st.divider()
-    with st.expander("🧮 Multa / juros por atraso (opcional)"):
-        st.caption("Calcule e decida se cobra ou perdoa. Os % vêm do cadastro do imóvel.")
+    with st.expander("🧮 Calculadora de multa / juros por atraso (opcional)"):
+        st.caption("Calcule o valor e depois digite no lançamento. Os % vêm do cadastro do imóvel.")
         selm = st.selectbox("Imóvel", list(op.keys()), key="mj")
         lr = lojas[lojas["Loja"] == op[selm]].iloc[0]
         m1, m2, m3 = st.columns(3)
-        base = m1.number_input("Valor base", min_value=0.0,
-                               value=num(lr["Aluguel Atual"]), step=50.0, format="%.2f", key="mjb")
+        base = m1.number_input("Valor base", min_value=0.0, value=num(lr["Aluguel Atual"]),
+                               step=50.0, format="%.2f", key="mjb")
         venc = m2.date_input("Vencimento", value=dt.date.today().replace(day=1),
                              format="DD/MM/YYYY", key="mjv")
         pgto = m3.date_input("Pagamento", value=dt.date.today(), format="DD/MM/YYYY", key="mjp")
         m4, m5 = st.columns(2)
         mpct = m4.number_input("Multa %", min_value=0.0, value=num(lr["Multa %"]) or 2.0,
                                step=0.5, format="%.2f", key="mjm")
-        jpct = m5.number_input("Juros % a.m.", min_value=0.0, value=num(lr["Juros % a.m."]) or 1.0,
+        jpct = m5.number_input("Juros % a.m.", min_value=0.0,
+                               value=num(lr["Juros % a.m."]) or 1.0,
                                step=0.5, format="%.2f", key="mjj")
         dias = max((pgto - venc).days, 0)
         mv = round(base * mpct / 100, 2)
         jv = round(base * jpct / 100 * dias / 30, 2)
-        tot = round(mv + jv, 2)
         if dias <= 0:
             st.info("Sem atraso.")
         else:
             st.write(f"Atraso **{dias} dia(s)** · Multa {brl(mv)} · Juros {brl(jv)} · "
-                     f"**Total {brl(tot)}**")
+                     f"**Total {brl(mv + jv)}**")
 
     st.divider()
     st.markdown("**Últimos lançamentos**")
@@ -341,9 +352,9 @@ def pagina_lancamentos():
     for _, r in pags.tail(15).iloc[::-1].iterrows():
         linha_planilha = int(r["__linha"])
         c1, c2 = st.columns([6, 1])
-        c1.write(f'**{r.get("Data Pagamento","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
-                 f'devido {brl(num(r["Aluguel Devido"]))} · pago {brl(num(r["Valor Pago"]))}'
-                 + (f' · _{r["Observação"]}_' if r.get("Observação") else ""))
+        c1.write(f'**{r.get("Dt Lcto","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
+                 f'{r.get("Referente","") or "—"} · lançado {brl(num(r["Valor Lcto"]))} · '
+                 f'pago {brl(total_pago(r))}')
         if c2.button("🗑️", key=f"dl{linha_planilha}"):
             excluir_linha("Pagamentos", linha_planilha)
             st.rerun()
@@ -362,66 +373,72 @@ def pagina_extrato():
     loja_id = op[sel]
     lr = lojas[lojas["Loja"] == loja_id].iloc[0]
 
-    saldo = num(lr["Saldo Inicial"])
+    saldo_inicial = num(lr["Saldo Inicial"])
     p = (pags[pags["Loja"].astype(str) == str(loja_id)].copy()
          if not pags.empty else pd.DataFrame())
 
-    # ---- monta as linhas do extrato (com o saldo acumulado) ------------------ #
     linhas = []
-    if saldo:
-        linhas.append({"Data": "—", "Lançamento": "Saldo inicial", "Cobrança": "",
-                       "Recebido": "", "Saldo": brl(saldo), "__linha": None})
-
+    acum = saldo_inicial
     if not p.empty:
-        p["__d"] = p["Data Pagamento"].apply(to_date)
+        p["__d"] = p["Dt Lcto"].apply(to_date)
         p = p.sort_values("__d", na_position="last")
         for _, r in p.iterrows():
-            cob = num(r["Aluguel Devido"]) + num(r["IPTU/Taxa"]) + num(r["Multa/Juros"])
-            rec = num(r["Valor Pago"]) + num(r["Pago em Produtos"])
-            saldo += cob - rec
-            linhas.append({"Data": r.get("Data Pagamento", ""),
-                           "Lançamento": r.get("Observação", "") or "Movimentação",
-                           "Cobrança": brl(cob) if cob else "",
-                           "Recebido": brl(rec) if rec else "",
-                           "Saldo": brl(saldo),
-                           "__linha": int(r["__linha"])})
+            lcto = num(r["Valor Lcto"])
+            tot = total_pago(r)
+            acum += lcto - tot
+            linhas.append({
+                "Dt Lcto": r.get("Dt Lcto", ""),
+                "Referente": r.get("Referente", "") or "—",
+                "R$ Valor Lcto": lcto,
+                "R$ Valor Pago": num(r["Valor Pago"]),
+                "Multa": num(r["Multa"]),
+                "Juros": num(r["Juros"]),
+                "CM": num(r["CM"]),
+                "R$ Total Pago": tot,
+                "Saldo Devedor": lcto - tot,
+                "Saldo Acum.": acum,
+                "__linha": int(r["__linha"]),
+            })
+
+    if saldo_inicial:
+        st.caption(f"Saldo inicial (cadastro do imóvel): **{brl(saldo_inicial)}**")
 
     modo_edicao = st.toggle("🗑️ Habilitar exclusão de lançamentos", value=False,
                             key="ext_edit",
                             help="Ative para mostrar o botão de excluir em cada linha. "
                                  "A exclusão remove o registro da planilha (aba Pagamentos).")
 
-    # ---- renderiza a tabela -------------------------------------------------- #
+    COLS = ["Dt Lcto", "Referente", "R$ Valor Lcto", "R$ Valor Pago", "Multa",
+            "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum."]
+    NUMERICAS = COLS[2:]
+
     if not linhas:
         st.info("Nenhum lançamento para este imóvel.")
     elif not modo_edicao:
-        st.dataframe(pd.DataFrame(linhas).drop(columns=["__linha"]),
-                     use_container_width=True, hide_index=True)
+        df = pd.DataFrame(linhas)[COLS].copy()
+        for c in NUMERICAS:
+            df[c] = df[c].apply(brl)
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        larguras = [1.2, 2.6, 1.3, 1.3, 1.4, 0.9]
+        larguras = [1.0, 1.5, 1.1, 1.1, 0.9, 0.9, 0.9, 1.1, 1.1, 1.1, 0.9]
         h = st.columns(larguras)
-        for col, titulo in zip(h, ["Data", "Lançamento", "Cobrança", "Recebido",
-                                   "Saldo", "Ação"]):
-            col.markdown(f"**{titulo}**")
+        for col, titulo in zip(h, COLS + ["Ação"]):
+            col.markdown(f"<small><b>{titulo}</b></small>", unsafe_allow_html=True)
         st.markdown("<hr style='margin:2px 0 8px 0'>", unsafe_allow_html=True)
 
         alvo = st.session_state.get("ext_confirm")
 
         for item in linhas:
             c = st.columns(larguras)
-            c[0].write(item["Data"])
-            c[1].write(item["Lançamento"])
-            c[2].write(item["Cobrança"] or "—")
-            c[3].write(item["Recebido"] or "—")
-            c[4].write(item["Saldo"])
+            c[0].write(item["Dt Lcto"])
+            c[1].write(item["Referente"])
+            for i, campo in enumerate(NUMERICAS, start=2):
+                v = item[campo]
+                c[i].write(brl(v) if v else "—")
 
             linha_planilha = item["__linha"]
-            if linha_planilha is None:
-                c[5].caption("—")   # saldo inicial: edite na aba Imóveis
-                continue
-
             if alvo == linha_planilha:
-                b1, b2 = c[5].columns(2)
+                b1, b2 = c[10].columns(2)
                 if b1.button("✅", key=f"ok{linha_planilha}", help="Confirmar exclusão"):
                     excluir_linha("Pagamentos", linha_planilha)
                     st.session_state.pop("ext_confirm", None)
@@ -431,7 +448,7 @@ def pagina_extrato():
                     st.session_state.pop("ext_confirm", None)
                     st.rerun()
             else:
-                if c[5].button("🗑️", key=f"ex{linha_planilha}", help="Excluir lançamento"):
+                if c[10].button("🗑️", key=f"ex{linha_planilha}", help="Excluir lançamento"):
                     st.session_state["ext_confirm"] = linha_planilha
                     st.rerun()
 
@@ -440,10 +457,10 @@ def pagina_extrato():
                        "A ação não pode ser desfeita.")
 
     st.divider()
-    if saldo > 0.005:
-        st.error(f"Saldo devedor atual: **{brl(saldo)}**")
-    elif saldo < -0.005:
-        st.info(f"Crédito a favor: **{brl(-saldo)}**")
+    if acum > 0.005:
+        st.error(f"Saldo devedor atual: **{brl(acum)}**")
+    elif acum < -0.005:
+        st.info(f"Crédito a favor: **{brl(-acum)}**")
     else:
         st.success("Conta em dia. ✅")
 
@@ -476,11 +493,11 @@ def pagina_reajustes():
                 ws("Reajustes").append_row(
                     [op[sel], data.strftime("%d/%m/%Y"), indice, perc, atual, novo],
                     value_input_option="USER_ENTERED")
-                # atualiza o aluguel atual e o próximo reajuste na aba Lojas
                 wl = ws("Lojas")
                 cell = wl.find(str(op[sel]), in_column=1)
                 wl.update_cell(cell.row, 3, novo)
-                wl.update_cell(cell.row, 9, (data + dt.timedelta(days=365)).strftime("%d/%m/%Y"))
+                wl.update_cell(cell.row, 9,
+                               (data + dt.timedelta(days=365)).strftime("%d/%m/%Y"))
                 st.success(f"Reajuste aplicado: {brl(atual)} → {brl(novo)}.")
                 st.rerun()
 
@@ -494,10 +511,9 @@ def pagina_reajustes():
     st.dataframe(dfr.drop(columns=["__linha"]), use_container_width=True, hide_index=True)
 
     with st.expander("🗑️ Excluir um reajuste do histórico"):
-        st.caption("Excluir aqui remove apenas o registro do histórico. "
-                   "O 'Aluguel Atual' do imóvel NÃO volta ao valor anterior — "
-                   "se precisar, ajuste na aba Imóveis.")
-        rot = {f'linha {int(r["__linha"])} · {r["Loja"]} · {r["Data"]} · '
+        st.caption("Excluir aqui remove apenas o registro do histórico. O 'Aluguel Atual' "
+                   "do imóvel NÃO volta ao valor anterior — ajuste na aba Imóveis se precisar.")
+        rot = {f'linha {int(r["__linha"])} · Loja {r["Loja"]} · {r["Data"]} · '
                f'{r["Índice"]} {r["%"]}% · {brl(num(r["Valor Anterior"]))} → '
                f'{brl(num(r["Valor Novo"]))}': int(r["__linha"])
                for _, r in dfr.iterrows()}
@@ -532,7 +548,8 @@ def pagina_imoveis():
                                      value=str(r.get("Próximo Reajuste", "")))
                 c6, c7 = st.columns(2)
                 mpct = c6.number_input("Multa %", value=num(r["Multa %"]) or 2.0, step=0.5)
-                jpct = c7.number_input("Juros % a.m.", value=num(r["Juros % a.m."]) or 1.0, step=0.5)
+                jpct = c7.number_input("Juros % a.m.", value=num(r["Juros % a.m."]) or 1.0,
+                                       step=0.5)
                 obs = st.text_area("Observação", value=str(r.get("Observação", "")))
 
                 if st.form_submit_button("💾 Salvar", type="primary"):
