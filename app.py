@@ -5,8 +5,9 @@ Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
 O app lê/escreve via gspread (conta de serviço). Os cálculos são feitos em
 Python, então a planilha guarda apenas os campos que o usuário digita.
 
-Aba Pagamentos (colunas A..I):
+Aba Pagamentos (colunas A..J):
     Loja | Dt Lcto | Referente | Dt Vcto | Valor Lcto | Valor Pago | Multa | Juros | CM
+    | Observação
 
     Total Pago    = Valor Pago + Multa + Juros + CM   (calculado)
     Saldo Devedor = Valor Lcto - Total Pago           (calculado)
@@ -34,9 +35,9 @@ from google.oauth2.service_account import Credentials
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Início Contrato",
            "Saldo Inicial", "Multa %", "Juros % a.m.", "Próximo Reajuste", "Observação"]
 
-# Aba Pagamentos — colunas A..I
+# Aba Pagamentos — colunas A..J
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
-         "Valor Pago", "Multa", "Juros", "CM"]
+         "Valor Pago", "Multa", "Juros", "CM", "Observação"]
 
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
@@ -283,6 +284,7 @@ def modal_lancamento_ok(d: dict):
 | **R$ Valor Lcto** | {brl(d['valor_lcto'])} |
 | **R$ Total Pago** | {brl(d['total_pago'])} |
 | **Saldo do lançamento** | {brl(d['saldo'])} |
+| **Observação** | {d.get('observacao') or '—'} |
 """
     )
     if d["saldo"] > 0.005:
@@ -343,6 +345,10 @@ def pagina_lancamentos():
         cm = c8.number_input("R$ CM (correção monetária)", min_value=0.0,
                              step=10.0, format="%.2f")
 
+        observacao = st.text_area(
+            "Observação", value="", height=80,
+            placeholder="Opcional: acordo, pagamento a maior, desconto concedido...")
+
         st.caption("R$ Total Pago = Valor Pago + Multa + Juros + CM  ·  "
                    "Saldo Devedor = Valor Lcto − Total Pago")
 
@@ -350,7 +356,7 @@ def pagina_lancamentos():
             ws("Pagamentos").append_row(
                 [op[sel], data.strftime("%d/%m/%Y"), referente,
                  dt_vcto.strftime("%d/%m/%Y"),
-                 valor_lcto, valor_pago, multa, juros, cm],
+                 valor_lcto, valor_pago, multa, juros, cm, observacao],
                 value_input_option="USER_ENTERED")
             tot = valor_pago + multa + juros + cm
             st.session_state["lcto_ok"] = {
@@ -361,6 +367,7 @@ def pagina_lancamentos():
                 "valor_lcto": valor_lcto,
                 "total_pago": tot,
                 "saldo": valor_lcto - tot,
+                "observacao": observacao,
             }
             st.rerun()
 
@@ -405,7 +412,8 @@ def pagina_lancamentos():
         c1, c2 = st.columns([6, 1])
         c1.write(f'**{r.get("Dt Lcto","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
                  f'{r.get("Referente","") or "—"} · vcto {r.get("Dt Vcto","") or "—"} · '
-                 f'lançado {brl(num(r["Valor Lcto"]))} · pago {brl(total_pago(r))}')
+                 f'lançado {brl(num(r["Valor Lcto"]))} · pago {brl(total_pago(r))}'
+                 + (f' · _{r["Observação"]}_' if r.get("Observação") else ""))
         if c2.button("🗑️", key=f"dl{linha_planilha}"):
             excluir_linha("Pagamentos", linha_planilha)
             st.rerun()
@@ -449,6 +457,7 @@ def pagina_extrato():
                 "R$ Total Pago": tot,
                 "Saldo Devedor": lcto - tot,
                 "Saldo Acum.": acum,
+                "Observação": r.get("Observação", "") or "",
                 "__linha": int(r["__linha"]),
             })
 
@@ -461,9 +470,11 @@ def pagina_extrato():
                                  "A exclusão remove o registro da planilha.")
 
     COLS = ["Dt Lcto", "Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
-            "Multa", "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum."]
+            "Multa", "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum.",
+            "Observação"]
     TEXTO = COLS[:3]          # Dt Lcto, Referente, Dt Vcto
-    NUMERICAS = COLS[3:]      # todas em R$
+    NUMERICAS = COLS[3:11]    # todas em R$
+    FINAL_TEXTO = ["Observação"]
 
     if not linhas:
         st.info("Nenhum lançamento para este imóvel.")
@@ -473,7 +484,7 @@ def pagina_extrato():
             df[c] = df[c].apply(brl)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        larguras = [1.0, 1.4, 1.0, 1.1, 1.1, 0.9, 0.9, 0.9, 1.1, 1.1, 1.1, 0.9]
+        larguras = [1.0, 1.3, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.3, 0.9]
         h = st.columns(larguras)
         for col, titulo in zip(h, COLS + ["Ação"]):
             col.markdown(f"<small><b>{titulo}</b></small>", unsafe_allow_html=True)
@@ -488,6 +499,7 @@ def pagina_extrato():
             for i, campo in enumerate(NUMERICAS, start=len(TEXTO)):
                 v = item[campo]
                 c[i].write(brl(v) if v else "—")
+            c[len(TEXTO) + len(NUMERICAS)].write(item["Observação"] or "—")
 
             linha_planilha = item["__linha"]
             acao = c[len(COLS)]
