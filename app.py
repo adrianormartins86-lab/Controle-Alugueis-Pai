@@ -312,11 +312,14 @@ def pagina_lancamentos():
 
     op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
 
-    with st.form("novo", clear_on_submit=True):
-        st.markdown("**Novo lançamento**")
-        sel = st.selectbox("Imóvel", list(op.keys()))
-        loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
+    st.markdown("**Novo lançamento**")
 
+    # Fora do form de propósito: assim o imóvel NÃO é resetado ao lançar,
+    # e os campos que dependem dele (Valor Lcto, Dt Vcto) atualizam na hora.
+    sel = st.selectbox("Imóvel", list(op.keys()), key="lc_imovel")
+    loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
+
+    with st.form("novo", clear_on_submit=True):
         dia_vcto = int(num(loja_row["Dia Vcto"]) or 1)
         hoje = dt.date.today()
         try:
