@@ -5,12 +5,11 @@ Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
 O app lê/escreve via gspread (conta de serviço). Os cálculos são feitos em
 Python, então a planilha guarda apenas os campos que o usuário digita.
 
-Modelo de lançamento (aba Pagamentos):
-    Valor Lcto     -> quanto foi lançado/cobrado (aluguel, IPTU, taxa, o que for)
-    Valor Pago     -> quanto o inquilino pagou referente ao lançamento
-    Multa/Juros/CM -> valores em R$ pagos a mais (digitados manualmente)
-    Total Pago     = Valor Pago + Multa + Juros + CM      (calculado)
-    Saldo Devedor  = Valor Lcto - Total Pago              (calculado)
+Aba Pagamentos (colunas A..H):
+    Loja | Dt Lcto | Referente | Valor Lcto | Valor Pago | Multa | Juros | CM
+
+    Total Pago    = Valor Pago + Multa + Juros + CM   (calculado)
+    Saldo Devedor = Valor Lcto - Total Pago           (calculado)
 
 Configuração (Streamlit secrets):
     app_password = "sua_senha"
@@ -35,8 +34,8 @@ from google.oauth2.service_account import Credentials
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Início Contrato",
            "Saldo Inicial", "Multa %", "Juros % a.m.", "Próximo Reajuste", "Observação"]
 
-# NOVO layout da aba Pagamentos (colunas A..I)
-H_PAG = ["Loja", "Competência", "Dt Lcto", "Referente", "Valor Lcto",
+# Aba Pagamentos — colunas A..H (sem Competência)
+H_PAG = ["Loja", "Dt Lcto", "Referente", "Valor Lcto",
          "Valor Pago", "Multa", "Juros", "CM"]
 
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
@@ -216,8 +215,8 @@ def checar_senha() -> bool:
 # ----------------------------------------------------------------------------- #
 # Páginas
 # ----------------------------------------------------------------------------- #
-def pagina_dashboard():
-    st.subheader("📊 Visão geral")
+def pagina_painel():
+    st.subheader("📊 Painel")
     lojas, pags = ler("Lojas", H_LOJAS), ler("Pagamentos", H_PAG)
     if lojas.empty:
         st.info("Cadastre imóveis na aba Imóveis.")
@@ -284,24 +283,23 @@ def pagina_lancamentos():
         sel = st.selectbox("Imóvel", list(op.keys()))
         loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
 
-        c1, c2, c3 = st.columns(3)
-        comp = c1.text_input("Competência (mês)", value=dt.date.today().strftime("%m/%Y"))
-        data = c2.date_input("Dt Lcto", value=dt.date.today(), format="DD/MM/YYYY")
-        referente = c3.text_input("Referente", value="Aluguel",
+        c1, c2 = st.columns(2)
+        data = c1.date_input("Dt Lcto", value=dt.date.today(), format="DD/MM/YYYY")
+        referente = c2.text_input("Referente", value="Aluguel",
                                   help="Digite livremente: Aluguel, IPTU, Multa, Acordo...")
 
-        c4, c5 = st.columns(2)
-        valor_lcto = c4.number_input("R$ Valor Lcto", min_value=0.0,
+        c3, c4 = st.columns(2)
+        valor_lcto = c3.number_input("R$ Valor Lcto", min_value=0.0,
                                      value=num(loja_row["Aluguel Atual"]),
                                      step=50.0, format="%.2f",
                                      help="Quanto foi cobrado/lançado.")
-        valor_pago = c5.number_input("R$ Valor Pago", min_value=0.0, step=50.0, format="%.2f",
+        valor_pago = c4.number_input("R$ Valor Pago", min_value=0.0, step=50.0, format="%.2f",
                                      help="Quanto foi pago referente a este lançamento.")
 
-        c6, c7, c8 = st.columns(3)
-        multa = c6.number_input("R$ Multa", min_value=0.0, step=10.0, format="%.2f")
-        juros = c7.number_input("R$ Juros", min_value=0.0, step=10.0, format="%.2f")
-        cm = c8.number_input("R$ CM (correção monetária)", min_value=0.0,
+        c5, c6, c7 = st.columns(3)
+        multa = c5.number_input("R$ Multa", min_value=0.0, step=10.0, format="%.2f")
+        juros = c6.number_input("R$ Juros", min_value=0.0, step=10.0, format="%.2f")
+        cm = c7.number_input("R$ CM (correção monetária)", min_value=0.0,
                              step=10.0, format="%.2f")
 
         st.caption("R$ Total Pago = Valor Pago + Multa + Juros + CM  ·  "
@@ -309,7 +307,7 @@ def pagina_lancamentos():
 
         if st.form_submit_button("Lançar", type="primary"):
             ws("Pagamentos").append_row(
-                [op[sel], comp, data.strftime("%d/%m/%Y"), referente,
+                [op[sel], data.strftime("%d/%m/%Y"), referente,
                  valor_lcto, valor_pago, multa, juros, cm],
                 value_input_option="USER_ENTERED")
             st.success("Lançamento salvo na planilha.")
@@ -317,7 +315,8 @@ def pagina_lancamentos():
 
     st.divider()
     with st.expander("🧮 Calculadora de multa / juros por atraso (opcional)"):
-        st.caption("Calcule o valor e depois digite no lançamento. Os % vêm do cadastro do imóvel.")
+        st.caption("Calcule o valor e depois digite no lançamento. "
+                   "Os % vêm do cadastro do imóvel.")
         selm = st.selectbox("Imóvel", list(op.keys()), key="mj")
         lr = lojas[lojas["Loja"] == op[selm]].iloc[0]
         m1, m2, m3 = st.columns(3)
@@ -325,7 +324,8 @@ def pagina_lancamentos():
                                step=50.0, format="%.2f", key="mjb")
         venc = m2.date_input("Vencimento", value=dt.date.today().replace(day=1),
                              format="DD/MM/YYYY", key="mjv")
-        pgto = m3.date_input("Pagamento", value=dt.date.today(), format="DD/MM/YYYY", key="mjp")
+        pgto = m3.date_input("Pagamento", value=dt.date.today(),
+                             format="DD/MM/YYYY", key="mjp")
         m4, m5 = st.columns(2)
         mpct = m4.number_input("Multa %", min_value=0.0, value=num(lr["Multa %"]) or 2.0,
                                step=0.5, format="%.2f", key="mjm")
@@ -406,7 +406,7 @@ def pagina_extrato():
     modo_edicao = st.toggle("🗑️ Habilitar exclusão de lançamentos", value=False,
                             key="ext_edit",
                             help="Ative para mostrar o botão de excluir em cada linha. "
-                                 "A exclusão remove o registro da planilha (aba Pagamentos).")
+                                 "A exclusão remove o registro da planilha.")
 
     COLS = ["Dt Lcto", "Referente", "R$ Valor Lcto", "R$ Valor Pago", "Multa",
             "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum."]
@@ -572,7 +572,7 @@ def main():
         return
 
     st.sidebar.title("🏠 Gestão de Aluguéis")
-    pag = st.sidebar.radio("Menu", ["Dashboard", "Lançamentos", "Extrato",
+    pag = st.sidebar.radio("Menu", ["Painel", "Lançamentos", "Extrato",
                                     "Reajustes", "Imóveis"])
     st.sidebar.divider()
     if st.sidebar.button("🔄 Recarregar dados"):
@@ -583,7 +583,7 @@ def main():
         st.rerun()
 
     try:
-        {"Dashboard": pagina_dashboard, "Lançamentos": pagina_lancamentos,
+        {"Painel": pagina_painel, "Lançamentos": pagina_lancamentos,
          "Extrato": pagina_extrato, "Reajustes": pagina_reajustes,
          "Imóveis": pagina_imoveis}[pag]()
     except Exception as e:
