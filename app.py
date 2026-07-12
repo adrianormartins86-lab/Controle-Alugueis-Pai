@@ -5,8 +5,8 @@ Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
 O app lê/escreve via gspread (conta de serviço). Os cálculos são feitos em
 Python, então a planilha guarda apenas os campos que o usuário digita.
 
-Aba Pagamentos (colunas A..H):
-    Loja | Dt Lcto | Referente | Valor Lcto | Valor Pago | Multa | Juros | CM
+Aba Pagamentos (colunas A..I):
+    Loja | Dt Lcto | Referente | Dt Vcto | Valor Lcto | Valor Pago | Multa | Juros | CM
 
     Total Pago    = Valor Pago + Multa + Juros + CM   (calculado)
     Saldo Devedor = Valor Lcto - Total Pago           (calculado)
@@ -34,8 +34,8 @@ from google.oauth2.service_account import Credentials
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Início Contrato",
            "Saldo Inicial", "Multa %", "Juros % a.m.", "Próximo Reajuste", "Observação"]
 
-# Aba Pagamentos — colunas A..H (sem Competência)
-H_PAG = ["Loja", "Dt Lcto", "Referente", "Valor Lcto",
+# Aba Pagamentos — colunas A..I
+H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
          "Valor Pago", "Multa", "Juros", "CM"]
 
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
@@ -283,23 +283,32 @@ def pagina_lancamentos():
         sel = st.selectbox("Imóvel", list(op.keys()))
         loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
 
-        c1, c2 = st.columns(2)
-        data = c1.date_input("Dt Lcto", value=dt.date.today(), format="DD/MM/YYYY")
+        dia_vcto = int(num(loja_row["Dia Vcto"]) or 1)
+        hoje = dt.date.today()
+        try:
+            venc_padrao = hoje.replace(day=dia_vcto)
+        except ValueError:
+            venc_padrao = hoje
+
+        c1, c2, c3 = st.columns(3)
+        data = c1.date_input("Dt Lcto", value=hoje, format="DD/MM/YYYY")
         referente = c2.text_input("Referente", value="Aluguel",
                                   help="Digite livremente: Aluguel, IPTU, Multa, Acordo...")
+        dt_vcto = c3.date_input("Dt Vcto", value=venc_padrao, format="DD/MM/YYYY",
+                                help="Vencimento do lançamento (puxa o dia do cadastro).")
 
-        c3, c4 = st.columns(2)
-        valor_lcto = c3.number_input("R$ Valor Lcto", min_value=0.0,
+        c4, c5 = st.columns(2)
+        valor_lcto = c4.number_input("R$ Valor Lcto", min_value=0.0,
                                      value=num(loja_row["Aluguel Atual"]),
                                      step=50.0, format="%.2f",
                                      help="Quanto foi cobrado/lançado.")
-        valor_pago = c4.number_input("R$ Valor Pago", min_value=0.0, step=50.0, format="%.2f",
+        valor_pago = c5.number_input("R$ Valor Pago", min_value=0.0, step=50.0, format="%.2f",
                                      help="Quanto foi pago referente a este lançamento.")
 
-        c5, c6, c7 = st.columns(3)
-        multa = c5.number_input("R$ Multa", min_value=0.0, step=10.0, format="%.2f")
-        juros = c6.number_input("R$ Juros", min_value=0.0, step=10.0, format="%.2f")
-        cm = c7.number_input("R$ CM (correção monetária)", min_value=0.0,
+        c6, c7, c8 = st.columns(3)
+        multa = c6.number_input("R$ Multa", min_value=0.0, step=10.0, format="%.2f")
+        juros = c7.number_input("R$ Juros", min_value=0.0, step=10.0, format="%.2f")
+        cm = c8.number_input("R$ CM (correção monetária)", min_value=0.0,
                              step=10.0, format="%.2f")
 
         st.caption("R$ Total Pago = Valor Pago + Multa + Juros + CM  ·  "
@@ -308,6 +317,7 @@ def pagina_lancamentos():
         if st.form_submit_button("Lançar", type="primary"):
             ws("Pagamentos").append_row(
                 [op[sel], data.strftime("%d/%m/%Y"), referente,
+                 dt_vcto.strftime("%d/%m/%Y"),
                  valor_lcto, valor_pago, multa, juros, cm],
                 value_input_option="USER_ENTERED")
             st.success("Lançamento salvo na planilha.")
@@ -353,8 +363,8 @@ def pagina_lancamentos():
         linha_planilha = int(r["__linha"])
         c1, c2 = st.columns([6, 1])
         c1.write(f'**{r.get("Dt Lcto","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
-                 f'{r.get("Referente","") or "—"} · lançado {brl(num(r["Valor Lcto"]))} · '
-                 f'pago {brl(total_pago(r))}')
+                 f'{r.get("Referente","") or "—"} · vcto {r.get("Dt Vcto","") or "—"} · '
+                 f'lançado {brl(num(r["Valor Lcto"]))} · pago {brl(total_pago(r))}')
         if c2.button("🗑️", key=f"dl{linha_planilha}"):
             excluir_linha("Pagamentos", linha_planilha)
             st.rerun()
@@ -389,6 +399,7 @@ def pagina_extrato():
             linhas.append({
                 "Dt Lcto": r.get("Dt Lcto", ""),
                 "Referente": r.get("Referente", "") or "—",
+                "Dt Vcto": r.get("Dt Vcto", "") or "—",
                 "R$ Valor Lcto": lcto,
                 "R$ Valor Pago": num(r["Valor Pago"]),
                 "Multa": num(r["Multa"]),
@@ -408,9 +419,10 @@ def pagina_extrato():
                             help="Ative para mostrar o botão de excluir em cada linha. "
                                  "A exclusão remove o registro da planilha.")
 
-    COLS = ["Dt Lcto", "Referente", "R$ Valor Lcto", "R$ Valor Pago", "Multa",
-            "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum."]
-    NUMERICAS = COLS[2:]
+    COLS = ["Dt Lcto", "Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
+            "Multa", "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum."]
+    TEXTO = COLS[:3]          # Dt Lcto, Referente, Dt Vcto
+    NUMERICAS = COLS[3:]      # todas em R$
 
     if not linhas:
         st.info("Nenhum lançamento para este imóvel.")
@@ -420,7 +432,7 @@ def pagina_extrato():
             df[c] = df[c].apply(brl)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        larguras = [1.0, 1.5, 1.1, 1.1, 0.9, 0.9, 0.9, 1.1, 1.1, 1.1, 0.9]
+        larguras = [1.0, 1.4, 1.0, 1.1, 1.1, 0.9, 0.9, 0.9, 1.1, 1.1, 1.1, 0.9]
         h = st.columns(larguras)
         for col, titulo in zip(h, COLS + ["Ação"]):
             col.markdown(f"<small><b>{titulo}</b></small>", unsafe_allow_html=True)
@@ -430,15 +442,16 @@ def pagina_extrato():
 
         for item in linhas:
             c = st.columns(larguras)
-            c[0].write(item["Dt Lcto"])
-            c[1].write(item["Referente"])
-            for i, campo in enumerate(NUMERICAS, start=2):
+            for i, campo in enumerate(TEXTO):
+                c[i].write(item[campo])
+            for i, campo in enumerate(NUMERICAS, start=len(TEXTO)):
                 v = item[campo]
                 c[i].write(brl(v) if v else "—")
 
             linha_planilha = item["__linha"]
+            acao = c[len(COLS)]
             if alvo == linha_planilha:
-                b1, b2 = c[10].columns(2)
+                b1, b2 = acao.columns(2)
                 if b1.button("✅", key=f"ok{linha_planilha}", help="Confirmar exclusão"):
                     excluir_linha("Pagamentos", linha_planilha)
                     st.session_state.pop("ext_confirm", None)
@@ -448,7 +461,7 @@ def pagina_extrato():
                     st.session_state.pop("ext_confirm", None)
                     st.rerun()
             else:
-                if c[10].button("🗑️", key=f"ex{linha_planilha}", help="Excluir lançamento"):
+                if acao.button("🗑️", key=f"ex{linha_planilha}", help="Excluir lançamento"):
                     st.session_state["ext_confirm"] = linha_planilha
                     st.rerun()
 
