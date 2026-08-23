@@ -2,3 +2,4 @@ streamlit>=1.47
 pandas>=2.0
 gspread>=6.0
 google-auth>=2.30
+fpdf2>=2.7
