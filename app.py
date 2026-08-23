@@ -28,6 +28,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import gspread
+from fpdf import FPDF, XPos, YPos
 from google.oauth2.service_account import Credentials
 
 # ----------------------------------------------------------------------------- #
@@ -192,6 +193,85 @@ def to_date(v):
 def total_pago(r) -> float:
     """Total Pago = Valor Pago + Multa + Juros + CM."""
     return num(r["Valor Pago"]) + num(r["Multa"]) + num(r["Juros"]) + num(r["CM"])
+
+
+def linhas_validas(df: pd.DataFrame) -> list:
+    """Filtra as linhas da grade (Entradas/Recebido) com descrição e valor preenchidos."""
+    out = []
+    for _, row in df.iterrows():
+        desc = str(row.get("Descrição") or "").strip()
+        valor = num(row.get("Valor"))
+        if desc and valor != 0:
+            out.append((desc, valor))
+    return out
+
+
+# ----------------------------------------------------------------------------- #
+# PDF do Demonstrativo Mensal
+# ----------------------------------------------------------------------------- #
+def pdf_seguro(txt) -> str:
+    """A fonte core do PDF (Helvetica) só desenha Latin-1 — troca pontuação
+    "esperta" (travessão, aspas curvas...) pelo equivalente simples e, se
+    ainda sobrar algo fora do Latin-1, substitui em vez de quebrar."""
+    if txt is None:
+        return ""
+    txt = str(txt)
+    for k, v in {"—": "-", "–": "-", "’": "'", "‘": "'",
+                 "“": '"', "”": '"', "…": "..."}.items():
+        txt = txt.replace(k, v)
+    return txt.encode("latin-1", "replace").decode("latin-1")
+
+
+def gerar_pdf_demonstrativo(loja_nome, mes_label, contrato_info, saldo_ant,
+                             entradas, tot_entradas, obs_entradas,
+                             recebido, tot_recebido, obs_recebido,
+                             pendente, obs_finais) -> bytes:
+    ROW_MID = dict(new_x=XPos.RIGHT, new_y=YPos.TOP)
+    ROW_END = dict(new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, pdf_seguro("Demonstrativo Mensal"), **ROW_END)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, pdf_seguro(f"{loja_nome} — {mes_label}"), **ROW_END)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.multi_cell(0, 5, pdf_seguro(contrato_info))
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, pdf_seguro(f"Saldo mês anterior: {brl(saldo_ant)}"), **ROW_END)
+    pdf.ln(3)
+
+    def tabela(titulo, linhas, total, obs):
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, pdf_seguro(titulo), **ROW_END)
+        pdf.set_fill_color(175, 198, 232)   # mesmo azul-claro do cabeçalho no app
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(130, 7, "Descrição", border=1, fill=True, **ROW_MID)
+        pdf.cell(50, 7, pdf_seguro("R$ Valor"), border=1, fill=True, align="R", **ROW_END)
+        pdf.set_font("Helvetica", "", 10)
+        for desc, val in linhas:
+            pdf.cell(130, 7, pdf_seguro(desc), border=1, **ROW_MID)
+            pdf.cell(50, 7, pdf_seguro(brl(val)), border=1, align="R", **ROW_END)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(130, 7, pdf_seguro(f"Total {titulo}"), border=1, **ROW_MID)
+        pdf.cell(50, 7, pdf_seguro(brl(total)), border=1, align="R", **ROW_END)
+        if obs:
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.multi_cell(0, 5, pdf_seguro(f"OBS: {obs}"))
+        pdf.ln(4)
+
+    tabela("Entradas", entradas, tot_entradas, obs_entradas)
+    tabela("Recebido no mês", recebido, tot_recebido, obs_recebido)
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 10, pdf_seguro(f"Pendente transferido pro mês seguinte: {brl(pendente)}"),
+             **ROW_END)
+    if obs_finais:
+        pdf.set_font("Helvetica", "I", 10)
+        pdf.multi_cell(0, 5, pdf_seguro(f"OBS: {obs_finais}"))
+
+    return bytes(pdf.output())
 
 
 # ----------------------------------------------------------------------------- #
@@ -385,7 +465,8 @@ def pagina_lancamentos():
     st.divider()
     st.markdown(f"**Entradas** · aluguel do mês vence em {vcto_aluguel.strftime('%d/%m/%Y')}")
     st.caption("Escreva livremente cada cobrança do mês (Aluguel, IPTU, condomínio, "
-               "multa, acordo...) e o valor. Adicione ou apague linhas como numa planilha.")
+               "multa, acordo...) e o valor. Adicione ou apague linhas como numa planilha "
+               "(Tab pula pro campo do valor, igual no Excel).")
     entradas_ini = pd.DataFrame(
         [{"Descrição": "Aluguel", "Valor": num(loja_row["Aluguel Atual"])}]
         + [{"Descrição": "", "Valor": 0.0}])
@@ -395,13 +476,13 @@ def pagina_lancamentos():
         column_config={
             "Descrição": st.column_config.TextColumn("Descrição", width="large"),
             "Valor": st.column_config.NumberColumn("R$ Valor", format="%.2f",
-                                                    min_value=0.0, step=50.0),
+                                                    min_value=0.0, step=0.01),
         })
-    obs_entradas = st.text_area("OBS (entradas)", height=60,
-                                key=f"obsent_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
     tot_entradas = float(pd.to_numeric(entradas_df.get("Valor"), errors="coerce")
                          .fillna(0).sum()) if not entradas_df.empty else 0.0
     st.markdown(f"**Total das Entradas: {brl(tot_entradas)}**")
+    obs_entradas = st.text_area("OBS (entradas)", height=60,
+                                key=f"obsent_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
 
     st.divider()
     st.markdown("**Recebido no mês** · valor total ou parcial")
@@ -414,13 +495,13 @@ def pagina_lancamentos():
         column_config={
             "Descrição": st.column_config.TextColumn("Descrição", width="large"),
             "Valor": st.column_config.NumberColumn("R$ Valor", format="%.2f",
-                                                    min_value=0.0, step=50.0),
+                                                    min_value=0.0, step=0.01),
         })
-    obs_recebido = st.text_area("OBS (recebido)", height=60,
-                                key=f"obsrec_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
     tot_recebido = float(pd.to_numeric(recebido_df.get("Valor"), errors="coerce")
                          .fillna(0).sum()) if not recebido_df.empty else 0.0
     st.markdown(f"**Total recebido: {brl(tot_recebido)}**")
+    obs_recebido = st.text_area("OBS (recebido)", height=60,
+                                key=f"obsrec_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
 
     st.divider()
     pendente = saldo_ant + tot_entradas - tot_recebido
@@ -434,28 +515,37 @@ def pagina_lancamentos():
     obs_finais = st.text_area("OBS finais", height=70,
                               key=f"obsfin_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
 
-    if st.button("💾 Salvar Demonstrativo do Mês", type="primary"):
+    entradas_ok = linhas_validas(entradas_df)
+    recebido_ok = linhas_validas(recebido_df)
+
+    b1, b2 = st.columns(2)
+    salvar = b1.button("💾 Salvar Demonstrativo do Mês", type="primary",
+                       use_container_width=True)
+    contrato_info = (f"Início do contrato: {loja_row.get('Assinatura Contrato') or '—'}   ·   "
+                     f"Próximo reajuste: {loja_row.get('Próximo Reajuste') or '—'}   ·   "
+                     f"Vcto do contrato: {loja_row.get('Vencimento Contrato') or '—'}")
+    pdf_bytes = gerar_pdf_demonstrativo(
+        sel, escolha, contrato_info, saldo_ant,
+        entradas_ok, tot_entradas, obs_entradas,
+        recebido_ok, tot_recebido, obs_recebido,
+        pendente, obs_finais)
+    b2.download_button(
+        "📄 Exportar PDF", data=pdf_bytes, use_container_width=True,
+        file_name=f"demonstrativo_loja{loja_id}_{mes_ref:02d}-{ano_ref}.pdf",
+        mime="application/pdf",
+        help="Gera um PDF com o que está preenchido na tela agora (salvo ou não) "
+             "pra mandar pro inquilino.")
+
+    if salvar:
         dt_lcto = hoje if (ano_ref, mes_ref) == (hoje.year, hoje.month) else ini_mes
         linhas = []
-        primeira = True
-        for _, row in entradas_df.iterrows():
-            desc = str(row.get("Descrição") or "").strip()
-            valor = num(row.get("Valor"))
-            if not desc or valor == 0:
-                continue
+        for i, (desc, valor) in enumerate(entradas_ok):
             vcto = vcto_aluguel.strftime("%d/%m/%Y") if desc.strip().lower() == "aluguel" else ""
             linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, vcto,
-                           valor, 0, 0, 0, 0, obs_entradas if primeira else ""])
-            primeira = False
-        primeira = True
-        for _, row in recebido_df.iterrows():
-            desc = str(row.get("Descrição") or "").strip()
-            valor = num(row.get("Valor"))
-            if not desc or valor == 0:
-                continue
+                           valor, 0, 0, 0, 0, obs_entradas if i == 0 else ""])
+        for i, (desc, valor) in enumerate(recebido_ok):
             linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, "",
-                           0, valor, 0, 0, 0, obs_recebido if primeira else ""])
-            primeira = False
+                           0, valor, 0, 0, 0, obs_recebido if i == 0 else ""])
         if obs_finais.strip():
             linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), f"OBS {escolha}",
                            "", 0, 0, 0, 0, 0, obs_finais.strip()])
