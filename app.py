@@ -265,7 +265,7 @@ def gerar_pdf_demonstrativo(loja_nome, mes_label, contrato_info, saldo_ant,
     tabela("Recebido no mês", recebido, tot_recebido, obs_recebido)
 
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 10, pdf_seguro(f"Pendente transferido pro mês seguinte: {brl(pendente)}"),
+    pdf.cell(0, 10, pdf_seguro(f"Valor transferido para o mês seguinte: {brl(pendente)}"),
              **ROW_END)
     if obs_finais:
         pdf.set_font("Helvetica", "I", 10)
