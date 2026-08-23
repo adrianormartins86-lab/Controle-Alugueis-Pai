@@ -409,8 +409,30 @@ def mes_soma(ano: int, mes: int, n: int) -> tuple:
     return idx // 12, idx % 12 + 1
 
 
+LANCAMENTOS_CSS = """
+<style>
+[data-testid="stMain"] p,
+[data-testid="stMain"] label,
+[data-testid="stMain"] .stMarkdown,
+[data-testid="stMain"] [data-testid="stCaptionContainer"],
+[data-testid="stMain"] [data-testid="stMetricLabel"],
+[data-testid="stMain"] [data-testid="stMetricValue"],
+[data-testid="stMain"] textarea {
+    font-weight: 700 !important;
+}
+</style>
+"""
+
+
 def pagina_lancamentos():
     st.subheader("🧾 Lançamentos — Demonstrativo Mensal")
+    # Negrito nessa página a pedido do usuário (cliente com dificuldade de
+    # visão). O peso da fonte "de fábrica" do app já subiu no config.toml
+    # (baseFontWeight) — isso é global, o Streamlit não permite por página —
+    # e aqui reforça pra negrito de verdade nos textos que o CSS alcança.
+    # O texto DENTRO da tabela (Descrição/Valor) é desenhado em canvas pelo
+    # componente da grade, então só o baseFontWeight do tema chega até ele.
+    st.markdown(LANCAMENTOS_CSS, unsafe_allow_html=True)
     lojas = ler("Lojas", H_LOJAS)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
