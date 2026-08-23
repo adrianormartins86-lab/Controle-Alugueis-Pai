@@ -32,12 +32,17 @@ from google.oauth2.service_account import Credentials
 # ----------------------------------------------------------------------------- #
 # Estrutura das abas
 # ----------------------------------------------------------------------------- #
-# Aba Lojas — colunas A..K
+# Aba Lojas — colunas A..L
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Dia Pgto",
            "Assinatura Contrato", "Débito Geral", "Caução", "Índice Reajuste",
-           "Vencimento Contrato", "Observação"]
+           "Vencimento Contrato", "Observação", "Próximo Reajuste"]
+# "Próximo Reajuste" foi acrescentada no FIM de propósito: assim as colunas já
+# existentes na planilha do cliente (A..K) não mudam de posição/sentido.
 
 INDICES = ["IGP-M", "IGP-DI", "IPCA", "INCC-DI"]
+
+MESES_PT = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho",
+            "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
 
 # Aba Pagamentos — colunas A..J
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
@@ -47,17 +52,16 @@ H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
 LOJAS_SEED = [
     [1, "Produtos Naturais -- Wilson Oliveira", 1100.00, 25, "", "", -4019.42, 0, "IGP-M",
-     "25/06/2026", "Saldo devedor: (-4.019,42) em 30/06/2026."],
+     "25/06/2026", "Saldo devedor: (-4.019,42) em 30/06/2026.", ""],
     [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", "", 0, 0, "IGP-M",
-     "25/05/2027", "Sala relocada em 25/04/2026 (antes: Bruna)."],
+     "25/05/2027", "Sala relocada em 25/04/2026 (antes: Bruna).", ""],
     [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", "", 1232.00, 0, "IGP-M",
-     "01/08/2026", "Refazer contrato 01/08/2026."],
+     "01/08/2026", "Refazer contrato 01/08/2026.", ""],
     [4, "D2 - Espetaria - Everton Argos Leão", 1270.30, 10, "", "", 0, 0, "INCC-DI",
-     "10/05/2027", "Reajuste INCC 5,86% em 10/05/2026."],
+     "10/05/2027", "Reajuste INCC 5,86% em 10/05/2026.", ""],
     [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", "", 0, 0, "IGP-M",
-     "", "Pagamentos em dia."],
-    [6, "Sala projetada (vaga)", 0, 1, "", "", 0, 0, "", "", ""],
-    [7, "Sala Disponível", 0, 12, "", "", 0, 0, "", "", ""],
+     "", "Pagamentos em dia.", ""],
+    [6, "Sala projetada (vaga)", 0, 1, "", "", 0, 0, "", "", "", ""],
 ]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
@@ -78,7 +82,7 @@ def get_spreadsheet():
 
 
 def garantir_estrutura(sh):
-    """Cria as abas e cabeçalhos que faltarem; cadastra os 7 imóveis se vazio."""
+    """Cria as abas e cabeçalhos que faltarem; cadastra os 6 imóveis se vazio."""
     titulos = {ws.title: ws for ws in sh.worksheets()}
 
     def garante(nome, header, ncols):
@@ -281,150 +285,164 @@ def pagina_painel():
                 txt + (f" (há {-dias} dias)" if dias < 0 else f" (em {dias} dias)"))
 
 
-@st.dialog("✅ Lançamento salvo")
-def modal_lancamento_ok(d: dict):
-    st.markdown(f"O lançamento foi gravado na planilha com sucesso.")
-    st.markdown(
-        f"""
-| | |
-|---|---|
-| **Imóvel** | {d['imovel']} |
-| **Dt Lcto** | {d['data']} |
-| **Referente** | {d['referente']} |
-| **Dt Vcto** | {d['vcto']} |
-| **R$ Valor Lcto** | {brl(d['valor_lcto'])} |
-| **R$ Total Pago** | {brl(d['total_pago'])} |
-| **Saldo do lançamento** | {brl(d['saldo'])} |
-| **Observação** | {d.get('observacao') or '—'} |
-"""
-    )
-    if d["saldo"] > 0.005:
-        st.warning(f"Ficou em aberto: {brl(d['saldo'])}")
-    elif d["saldo"] < -0.005:
-        st.info(f"Pagou a maior: {brl(-d['saldo'])}")
-    else:
-        st.success("Lançamento quitado. ✅")
-
-    if st.button("OK", type="primary", use_container_width=True):
-        st.session_state.pop("lcto_ok", None)
-        st.rerun()
+def mes_soma(ano: int, mes: int, n: int) -> tuple:
+    """Soma/subtrai n meses de (ano, mes), tipo um relógio de 12 posições."""
+    idx = (ano * 12 + (mes - 1)) + n
+    return idx // 12, idx % 12 + 1
 
 
 def pagina_lancamentos():
-    st.subheader("➕ Lançamentos")
+    st.subheader("🧾 Lançamentos — Demonstrativo Mensal")
     lojas = ler("Lojas", H_LOJAS)
     if lojas.empty:
         st.info("Cadastre um imóvel primeiro.")
         return
 
-    # abre a janela de confirmação após o rerun do salvamento
-    if st.session_state.get("lcto_ok"):
-        modal_lancamento_ok(st.session_state["lcto_ok"])
-
     op = {f'{r["Loja"]} — {r["Responsável"]}': r["Loja"] for _, r in lojas.iterrows()}
 
-    st.markdown("**Novo lançamento**")
+    # Fora do form de propósito: assim o imóvel e o mês NÃO são resetados a
+    # cada interação, e os campos que dependem deles atualizam na hora.
+    c1, c2 = st.columns([2, 1])
+    sel = c1.selectbox("Imóvel", list(op.keys()), key="lc_imovel")
+    loja_id = op[sel]
+    loja_row = lojas[lojas["Loja"] == loja_id].iloc[0]
 
-    # Fora do form de propósito: assim o imóvel NÃO é resetado ao lançar,
-    # e os campos que dependem dele (Valor Lcto, Dt Vcto) atualizam na hora.
-    sel = st.selectbox("Imóvel", list(op.keys()), key="lc_imovel")
-    loja_row = lojas[lojas["Loja"] == op[sel]].iloc[0]
+    hoje = dt.date.today()
+    opcoes_mes = [mes_soma(hoje.year, hoje.month, i) for i in range(-6, 3)]
+    labels_mes = [f"{MESES_PT[m - 1]}/{a}" for a, m in opcoes_mes]
+    escolha = c2.selectbox("Mês de referência", labels_mes,
+                           index=opcoes_mes.index((hoje.year, hoje.month)),
+                           key="lc_mes")
+    ano_ref, mes_ref = opcoes_mes[labels_mes.index(escolha)]
+    ini_mes = dt.date(ano_ref, mes_ref, 1)
 
-    with st.form("novo", clear_on_submit=True):
-        dia_vcto = int(num(loja_row["Dia Vcto"]) or 1)
-        hoje = dt.date.today()
-        try:
-            venc_padrao = hoje.replace(day=dia_vcto)
-        except ValueError:
-            venc_padrao = hoje
+    h1, h2, h3 = st.columns(3)
+    h1.caption(f"📄 **Início do contrato:** {loja_row.get('Assinatura Contrato') or '—'}")
+    h2.caption(f"📈 **Próximo reajuste:** {loja_row.get('Próximo Reajuste') or '—'}")
+    h3.caption(f"⏳ **Vcto do contrato:** {loja_row.get('Vencimento Contrato') or '—'}")
 
-        c1, c2, c3 = st.columns(3)
-        data = c1.date_input("Dt Lcto", value=hoje, format="DD/MM/YYYY")
-        referente = c2.text_input("Referente", value="Aluguel",
-                                  help="Digite livremente: Aluguel, IPTU, Multa, Acordo...")
-        dt_vcto = c3.date_input("Dt Vcto", value=venc_padrao, format="DD/MM/YYYY",
-                                help="Vencimento do lançamento (puxa o dia do cadastro).")
+    pags = ler("Pagamentos", H_PAG, com_linha=True)
+    p_loja = (pags[pags["Loja"].astype(str) == str(loja_id)].copy()
+              if not pags.empty else pd.DataFrame())
+    if not p_loja.empty:
+        p_loja["__d"] = p_loja["Dt Lcto"].apply(to_date)
 
-        c4, c5 = st.columns(2)
-        valor_lcto = c4.number_input("R$ Valor Lcto", min_value=0.0,
-                                     value=num(loja_row["Aluguel Atual"]),
-                                     step=50.0, format="%.2f",
-                                     help="Quanto foi cobrado/lançado.")
-        valor_pago = c5.number_input("R$ Valor Pago", min_value=0.0, step=50.0, format="%.2f",
-                                     help="Quanto foi pago referente a este lançamento.")
+    # --- saldo mês anterior (calculado a partir do histórico) ---
+    saldo_ant = num(loja_row["Débito Geral"])
+    if not p_loja.empty:
+        antes = p_loja[p_loja["__d"].apply(
+            lambda d: d is not None and not pd.isna(d) and d.date() < ini_mes)]
+        for _, r in antes.iterrows():
+            saldo_ant += num(r["Valor Lcto"]) - total_pago(r)
+    st.metric("Saldo mês anterior", brl(saldo_ant))
 
-        c6, c7, c8 = st.columns(3)
-        multa = c6.number_input("R$ Multa", min_value=0.0, step=10.0, format="%.2f")
-        juros = c7.number_input("R$ Juros", min_value=0.0, step=10.0, format="%.2f")
-        cm = c8.number_input("R$ CM (correção monetária)", min_value=0.0,
-                             step=10.0, format="%.2f")
+    dia_vcto = int(num(loja_row["Dia Vcto"]) or 1)
+    try:
+        vcto_aluguel = dt.date(ano_ref, mes_ref, dia_vcto)
+    except ValueError:
+        vcto_aluguel = ini_mes
 
-        observacao = st.text_area(
-            "Observação", value="", height=80,
-            placeholder="Opcional: acordo, pagamento a maior, desconto concedido...")
+    reset_key = st.session_state.get(f"lc_reset_{loja_id}_{ano_ref}_{mes_ref}", 0)
 
-        st.caption("R$ Total Pago = Valor Pago + Multa + Juros + CM  ·  "
-                   "Saldo Devedor = Valor Lcto − Total Pago")
+    st.divider()
+    st.markdown(f"**Entradas** · aluguel do mês vence em {vcto_aluguel.strftime('%d/%m/%Y')}")
+    st.caption("Escreva livremente cada cobrança do mês (Aluguel, IPTU, condomínio, "
+               "multa, acordo...) e o valor. Adicione ou apague linhas como numa planilha.")
+    entradas_ini = pd.DataFrame([{"Descrição": "Aluguel", "Valor": num(loja_row["Aluguel Atual"])}])
+    entradas_df = st.data_editor(
+        entradas_ini, num_rows="dynamic", use_container_width=True, hide_index=True,
+        key=f"ent_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}",
+        column_config={
+            "Descrição": st.column_config.TextColumn("Descrição", width="large"),
+            "Valor": st.column_config.NumberColumn("R$ Valor", format="%.2f",
+                                                    min_value=0.0, step=50.0),
+        })
+    obs_entradas = st.text_area("OBS (entradas)", height=60,
+                                key=f"obsent_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
+    tot_entradas = float(pd.to_numeric(entradas_df.get("Valor"), errors="coerce")
+                         .fillna(0).sum()) if not entradas_df.empty else 0.0
+    st.markdown(f"**Total das Entradas: {brl(tot_entradas)}**")
 
-        if st.form_submit_button("Lançar", type="primary"):
-            ws("Pagamentos").append_row(
-                [op[sel], data.strftime("%d/%m/%Y"), referente,
-                 dt_vcto.strftime("%d/%m/%Y"),
-                 valor_lcto, valor_pago, multa, juros, cm, observacao],
-                value_input_option="USER_ENTERED")
-            tot = valor_pago + multa + juros + cm
-            st.session_state["lcto_ok"] = {
-                "imovel": sel,
-                "data": data.strftime("%d/%m/%Y"),
-                "referente": referente or "—",
-                "vcto": dt_vcto.strftime("%d/%m/%Y"),
-                "valor_lcto": valor_lcto,
-                "total_pago": tot,
-                "saldo": valor_lcto - tot,
-                "observacao": observacao,
-            }
+    st.divider()
+    st.markdown("**Recebido no mês** · valor total ou parcial")
+    recebido_ini = pd.DataFrame(columns=["Descrição", "Valor"]).astype({"Valor": "float64"})
+    recebido_df = st.data_editor(
+        recebido_ini, num_rows="dynamic", use_container_width=True, hide_index=True,
+        key=f"rec_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}",
+        column_config={
+            "Descrição": st.column_config.TextColumn("Descrição", width="large"),
+            "Valor": st.column_config.NumberColumn("R$ Valor", format="%.2f",
+                                                    min_value=0.0, step=50.0),
+        })
+    obs_recebido = st.text_area("OBS (recebido)", height=60,
+                                key=f"obsrec_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
+    tot_recebido = float(pd.to_numeric(recebido_df.get("Valor"), errors="coerce")
+                         .fillna(0).sum()) if not recebido_df.empty else 0.0
+    st.markdown(f"**Total recebido: {brl(tot_recebido)}**")
+
+    st.divider()
+    pendente = saldo_ant + tot_entradas - tot_recebido
+    if pendente > 0.005:
+        st.error(f"**Pendente transferido pro mês seguinte: {brl(pendente)}**")
+    elif pendente < -0.005:
+        st.info(f"**Crédito transferido pro mês seguinte: {brl(-pendente)}**")
+    else:
+        st.success("**Mês fechado em dia.**")
+
+    obs_finais = st.text_area("OBS finais", height=70,
+                              key=f"obsfin_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}")
+
+    if st.button("💾 Salvar Demonstrativo do Mês", type="primary"):
+        dt_lcto = hoje if (ano_ref, mes_ref) == (hoje.year, hoje.month) else ini_mes
+        linhas = []
+        primeira = True
+        for _, row in entradas_df.iterrows():
+            desc = str(row.get("Descrição") or "").strip()
+            valor = num(row.get("Valor"))
+            if not desc or valor == 0:
+                continue
+            vcto = vcto_aluguel.strftime("%d/%m/%Y") if desc.strip().lower() == "aluguel" else ""
+            linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, vcto,
+                           valor, 0, 0, 0, 0, obs_entradas if primeira else ""])
+            primeira = False
+        primeira = True
+        for _, row in recebido_df.iterrows():
+            desc = str(row.get("Descrição") or "").strip()
+            valor = num(row.get("Valor"))
+            if not desc or valor == 0:
+                continue
+            linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, "",
+                           0, valor, 0, 0, 0, obs_recebido if primeira else ""])
+            primeira = False
+        if obs_finais.strip():
+            linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), f"OBS {escolha}",
+                           "", 0, 0, 0, 0, 0, obs_finais.strip()])
+
+        if not linhas:
+            st.warning("Nada para salvar — preencha ao menos uma linha com descrição e valor.")
+        else:
+            ws("Pagamentos").append_rows(linhas, value_input_option="USER_ENTERED")
+            st.session_state[f"lc_reset_{loja_id}_{ano_ref}_{mes_ref}"] = reset_key + 1
+            st.success(f"Demonstrativo de {escolha} salvo — {len(linhas)} linha(s) gravada(s).")
             st.rerun()
 
+    # --- o que já está lançado neste mês ---
     st.divider()
-    with st.expander("🧮 Calculadora de multa / juros por atraso (opcional)"):
-        st.caption("Calcule o valor e depois digite nos campos Multa / Juros do lançamento.")
-        selm = st.selectbox("Imóvel", list(op.keys()), key="mj")
-        lr = lojas[lojas["Loja"] == op[selm]].iloc[0]
-        m1, m2, m3 = st.columns(3)
-        base = m1.number_input("Valor base", min_value=0.0, value=num(lr["Aluguel Atual"]),
-                               step=50.0, format="%.2f", key="mjb")
-        venc = m2.date_input("Vencimento", value=dt.date.today().replace(day=1),
-                             format="DD/MM/YYYY", key="mjv")
-        pgto = m3.date_input("Pagamento", value=dt.date.today(),
-                             format="DD/MM/YYYY", key="mjp")
-        m4, m5 = st.columns(2)
-        mpct = m4.number_input("Multa %", min_value=0.0, value=2.0,
-                               step=0.5, format="%.2f", key="mjm")
-        jpct = m5.number_input("Juros % a.m.", min_value=0.0, value=1.0,
-                               step=0.5, format="%.2f", key="mjj")
-        dias = max((pgto - venc).days, 0)
-        mv = round(base * mpct / 100, 2)
-        jv = round(base * jpct / 100 * dias / 30, 2)
-        if dias <= 0:
-            st.info("Sem atraso.")
-        else:
-            st.write(f"Atraso **{dias} dia(s)** · Multa {brl(mv)} · Juros {brl(jv)} · "
-                     f"**Total {brl(mv + jv)}**")
-
-    st.divider()
-    st.markdown("**Últimos lançamentos**")
-    pags = ler("Pagamentos", H_PAG, com_linha=True)
-    if pags.empty:
-        st.info("Sem lançamentos ainda.")
+    st.markdown(f"**Já lançado em {escolha}**")
+    do_mes = (p_loja[p_loja["__d"].apply(
+        lambda d: d is not None and not pd.isna(d)
+        and d.date().year == ano_ref and d.date().month == mes_ref)]
+        if not p_loja.empty else pd.DataFrame())
+    if do_mes.empty:
+        st.info("Sem lançamentos neste mês.")
         return
 
-    nomes = {r["Loja"]: r["Responsável"] for _, r in lojas.iterrows()}
-    for _, r in pags.tail(15).iloc[::-1].iterrows():
+    for _, r in do_mes.sort_values("__d").iterrows():
         linha_planilha = int(r["__linha"])
+        lado = (f'entrada {brl(num(r["Valor Lcto"]))}' if num(r["Valor Lcto"])
+                else f'recebido {brl(total_pago(r))}')
         c1, c2 = st.columns([6, 1])
-        c1.write(f'**{r.get("Dt Lcto","")}** · {nomes.get(r["Loja"], r["Loja"])} · '
-                 f'{r.get("Referente","") or "—"} · vcto {r.get("Dt Vcto","") or "—"} · '
-                 f'lançado {brl(num(r["Valor Lcto"]))} · pago {brl(total_pago(r))}'
+        c1.write(f'**{r.get("Dt Lcto","")}** · {r.get("Referente","") or "—"} · {lado}'
                  + (f' · _{r["Observação"]}_' if r.get("Observação") else ""))
         if c2.button("🗑️", key=f"dl{linha_planilha}"):
             excluir_linha("Pagamentos", linha_planilha)
@@ -629,26 +647,31 @@ def pagina_imoveis():
                                            help="Dia em que o inquilino costuma pagar. "
                                                 "0 = não informado.")
 
-                c5, c6, c7 = st.columns(3)
-                assinatura = c5.text_input("Data Assinatura Contrato (dd/mm/aaaa)",
+                c5, c6 = st.columns(2)
+                assinatura = c5.text_input("Início do Contrato (dd/mm/aaaa)",
                                            value=str(r.get("Assinatura Contrato", "")))
+                venc_contr = c6.text_input("Vencimento do Contrato (dd/mm/aaaa)",
+                                           value=str(r.get("Vencimento Contrato", "")))
 
-                indices_sel = c6.multiselect(
+                c7, c8 = st.columns(2)
+                prox_reaj = c7.text_input(
+                    "Próximo Reajuste (dd/mm/aaaa)",
+                    value=str(r.get("Próximo Reajuste", "")),
+                    help="Data prevista do próximo reajuste. Aparece no topo do "
+                         "Demonstrativo Mensal.")
+                indices_sel = c8.multiselect(
                     "Índice de Reajuste", INDICES,
                     default=parse_indices(r.get("Índice Reajuste", "")),
                     max_selections=2, key=f"idx{r['Loja']}",
                     help="Até 2 índices previstos em contrato. No menu Reajustes "
                          "o cliente escolhe qual dos dois aplicar.")
 
-                venc_contr = c7.text_input("Vencimento do Contrato (dd/mm/aaaa)",
-                                           value=str(r.get("Vencimento Contrato", "")))
-
-                c8, c9 = st.columns(2)
-                debito = c8.number_input("Débito Geral", value=num(r["Débito Geral"]),
+                c9, c10 = st.columns(2)
+                debito = c9.number_input("Débito Geral", value=num(r["Débito Geral"]),
                                          step=50.0, format="%.2f",
                                          help="Positivo = devedor · Negativo = crédito. "
                                               "É o ponto de partida do extrato.")
-                calcao = c9.number_input("Caução", min_value=0.0,
+                calcao = c10.number_input("Caução", min_value=0.0,
                                          value=num(r.get("Caução", 0)),
                                          step=50.0, format="%.2f",
                                          help="Valor do depósito de garantia (caução).")
@@ -658,16 +681,54 @@ def pagina_imoveis():
                 if st.form_submit_button("💾 Salvar", type="primary"):
                     wl = ws("Lojas")
                     cell = wl.find(str(r["Loja"]), in_column=1)
-                    # B..K = Responsável, Aluguel Atual, Dia Vcto, Dia Pgto,
+                    # B..L = Responsável, Aluguel Atual, Dia Vcto, Dia Pgto,
                     #        Assinatura Contrato, Débito Geral, Caução, Índice Reajuste,
-                    #        Vencimento Contrato, Observação
-                    wl.update(f"B{cell.row}:K{cell.row}",
+                    #        Vencimento Contrato, Observação, Próximo Reajuste
+                    wl.update(f"B{cell.row}:L{cell.row}",
                               [[resp, aluguel, dia_vcto, dia_pgto, assinatura,
                                 debito, calcao, ", ".join(indices_sel),
-                                venc_contr, obs]],
+                                venc_contr, obs, prox_reaj]],
                               value_input_option="USER_ENTERED")
                     st.success("Atualizado.")
                     st.rerun()
+
+            alvo = st.session_state.get("im_confirm_excluir")
+            if alvo == str(r["Loja"]):
+                st.warning(f'Excluir **{r["Loja"]} — {r["Responsável"]}**? Os '
+                           'lançamentos já registrados para esta loja continuam no '
+                           'Extrato, mas o imóvel some do cadastro. Não pode ser desfeito.')
+                b1, b2 = st.columns(2)
+                if b1.button("✅ Confirmar exclusão", key=f"delok{r['Loja']}",
+                             type="primary"):
+                    wl = ws("Lojas")
+                    cell = wl.find(str(r["Loja"]), in_column=1)
+                    excluir_linha("Lojas", cell.row)
+                    st.session_state.pop("im_confirm_excluir", None)
+                    st.toast("Imóvel excluído.", icon="🗑️")
+                    st.rerun()
+                if b2.button("↩️ Cancelar", key=f"delno{r['Loja']}"):
+                    st.session_state.pop("im_confirm_excluir", None)
+                    st.rerun()
+            else:
+                if st.button("🗑️ Excluir imóvel", key=f"del{r['Loja']}"):
+                    st.session_state["im_confirm_excluir"] = str(r["Loja"])
+                    st.rerun()
+
+    st.divider()
+    with st.expander("➕ Cadastrar novo imóvel"):
+        with st.form("novo_imovel", clear_on_submit=True):
+            novo_id = int(lojas["Loja"].astype(float).max()) + 1 if not lojas.empty else 1
+            st.caption(f"Será cadastrado como Loja **{novo_id}**.")
+            resp = st.text_input("Responsável")
+            aluguel = st.number_input("Aluguel atual", min_value=0.0, step=50.0,
+                                      format="%.2f")
+            dia_vcto = st.number_input("Dia Vcto", min_value=1, max_value=31, value=1)
+            if st.form_submit_button("💾 Cadastrar", type="primary"):
+                ws("Lojas").append_row(
+                    [novo_id, resp, aluguel, dia_vcto, "", "", 0, 0, "", "", "", ""],
+                    value_input_option="USER_ENTERED")
+                st.success(f"Loja {novo_id} cadastrada.")
+                st.rerun()
 
 
 # ----------------------------------------------------------------------------- #
