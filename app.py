@@ -249,8 +249,15 @@ def checar_senha() -> bool:
         return True
     st.markdown("### 🔐 Gestão de Aluguéis")
     sem_gerenciador_de_senha()
-    pwd = st.text_input("Senha", type="password")
-    if st.button("Entrar", type="primary"):
+    # Campo de senha + botão dentro de um st.form: sem form, clicar no botão (ou
+    # dar Enter) podia disparar o rerun ANTES do valor digitado terminar de ser
+    # confirmado pelo navegador, e o app comparava com um valor antigo/vazio —
+    # aparecia "Senha incorreta" mesmo com a senha certa. O form envia tudo
+    # junto, de uma vez, e resolve essa corrida.
+    with st.form("login"):
+        pwd = st.text_input("Senha", type="password")
+        entrar = st.form_submit_button("Entrar", type="primary")
+    if entrar:
         if pwd == senha:
             st.session_state["ok"] = True
             st.rerun()
@@ -396,7 +403,7 @@ def pagina_lancamentos():
 
     st.divider()
     st.markdown("**Recebido no mês** · valor total ou parcial")
-    recebido_ini = pd.DataFrame(columns=["Descrição", "Valor"]).astype({"Valor": "float64"})
+    recebido_ini = pd.DataFrame([{"Descrição": "Aluguel", "Valor": 0.0}])
     recebido_df = st.data_editor(
         recebido_ini, num_rows="dynamic", use_container_width=True, hide_index=True,
         key=f"rec_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}",
