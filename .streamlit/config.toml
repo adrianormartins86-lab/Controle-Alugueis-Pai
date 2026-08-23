@@ -4,6 +4,7 @@ backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F2F6FA"
 textColor = "#0B3D63"
 font = "sans serif"
+dataframeHeaderBackgroundColor = "#0B2545"
 
 [client]
 toolbarMode = "minimal"
