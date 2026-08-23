@@ -274,6 +274,56 @@ def gerar_pdf_demonstrativo(loja_nome, mes_label, contrato_info, saldo_ant,
     return bytes(pdf.output())
 
 
+def gerar_pdf_extrato(loja_nome, periodo_label, linhas, saldo_final) -> bytes:
+    """PDF do extrato de lançamentos (Descrição, Vcto, Entrada, Recebido,
+    Saldo Acum., Observação) para um período — mesma paleta do app."""
+    ROW_MID = dict(new_x=XPos.RIGHT, new_y=YPos.TOP)
+    ROW_END = dict(new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    L = {"desc": 68, "vcto": 24, "ent": 34, "rec": 34, "saldo": 34, "obs": 75}
+
+    pdf = FPDF(orientation="L")
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, pdf_seguro("Extrato de Lançamentos"), **ROW_END)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, pdf_seguro(f"{loja_nome} — {periodo_label}"), **ROW_END)
+    pdf.ln(3)
+
+    def cabecalho():
+        pdf.set_fill_color(175, 198, 232)   # mesmo azul-claro do cabeçalho no app
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(L["desc"], 7, pdf_seguro("Descrição"), border=1, fill=True, **ROW_MID)
+        pdf.cell(L["vcto"], 7, "Dt Vcto", border=1, fill=True, align="C", **ROW_MID)
+        pdf.cell(L["ent"], 7, pdf_seguro("Valor Entrada"), border=1, fill=True, align="R", **ROW_MID)
+        pdf.cell(L["rec"], 7, pdf_seguro("Valor Recebido"), border=1, fill=True, align="R", **ROW_MID)
+        pdf.cell(L["saldo"], 7, pdf_seguro("Saldo Acum."), border=1, fill=True, align="R", **ROW_MID)
+        pdf.cell(L["obs"], 7, pdf_seguro("Observação"), border=1, fill=True, **ROW_END)
+
+    def corta(txt, limite):
+        txt = pdf_seguro(txt)
+        return txt if len(txt) <= limite else txt[:limite - 3] + "..."
+
+    cabecalho()
+    pdf.set_font("Helvetica", "", 9)
+    for item in linhas:
+        if pdf.get_y() > 180:   # perto do fim da página em paisagem: nova página + cabeçalho
+            pdf.add_page()
+            cabecalho()
+            pdf.set_font("Helvetica", "", 9)
+        pdf.cell(L["desc"], 6, corta(item["Referente"], 42), border=1, **ROW_MID)
+        pdf.cell(L["vcto"], 6, pdf_seguro(item["Dt Vcto"]), border=1, align="C", **ROW_MID)
+        pdf.cell(L["ent"], 6, pdf_seguro(brl(item["R$ Valor Lcto"])), border=1, align="R", **ROW_MID)
+        pdf.cell(L["rec"], 6, pdf_seguro(brl(item["R$ Valor Pago"])), border=1, align="R", **ROW_MID)
+        pdf.cell(L["saldo"], 6, pdf_seguro(brl(item["Saldo Acum."])), border=1, align="R", **ROW_MID)
+        pdf.cell(L["obs"], 6, corta(item["Observação"], 48), border=1, **ROW_END)
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, pdf_seguro(f"Saldo atual: {brl(saldo_final)}"), **ROW_END)
+
+    return bytes(pdf.output())
+
+
 # ----------------------------------------------------------------------------- #
 # Cálculo de saldo
 # ----------------------------------------------------------------------------- #
@@ -650,6 +700,30 @@ def pagina_extrato():
     if saldo_inicial:
         st.caption(f"Débito geral (cadastro do imóvel): **{brl(saldo_inicial)}**")
 
+    # Filtro de período (por Dt Lcto) — mostra tudo por padrão.
+    datas_lcto = [d.date() for item in linhas
+                  if pd.notna(d := to_date(item["Dt Lcto"]))]
+    dt_min = min(datas_lcto) if datas_lcto else dt.date.today()
+    dt_max = max(datas_lcto) if datas_lcto else dt.date.today()
+
+    fc1, fc2 = st.columns(2)
+    data_ini = fc1.date_input("De", value=dt_min, format="DD/MM/YYYY", key="ext_de")
+    data_fim = fc2.date_input("Até", value=dt_max, format="DD/MM/YYYY", key="ext_ate")
+
+    def _em_periodo(item):
+        d = to_date(item["Dt Lcto"])
+        return pd.isna(d) or (data_ini <= d.date() <= data_fim)
+
+    linhas_periodo = [item for item in linhas if _em_periodo(item)]
+
+    if linhas_periodo:
+        periodo_label = f"{data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+        pdf_bytes = gerar_pdf_extrato(sel, periodo_label, linhas_periodo, acum)
+        st.download_button(
+            "📄 Exportar PDF do período", data=pdf_bytes,
+            file_name=f"extrato_{loja_id}_{data_ini.strftime('%Y%m%d')}_{data_fim.strftime('%Y%m%d')}.pdf",
+            mime="application/pdf")
+
     modo_edicao = st.toggle("🗑️ Habilitar exclusão de lançamentos", value=False,
                             key="ext_edit",
                             help="Ative para mostrar o botão de excluir em cada linha. "
@@ -661,26 +735,27 @@ def pagina_extrato():
             "Multa", "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum.",
             "Observação"]
 
-    # Colunas exibidas: sem Dt Lcto/Multa/Juros/CM, e com nomes mais claros
-    # para o "Referente" ganhar mais espaço na tela.
+    # Colunas exibidas: sem Dt Lcto/Multa/Juros/CM/R$ Total Pago/Saldo Devedor,
+    # e com nomes mais claros — "Descrição" com o máximo de espaço possível.
     COLS_EXIBIR = ["Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
-                   "R$ Total Pago", "Saldo Devedor", "Saldo Acum.", "Observação"]
+                   "Saldo Acum.", "Observação"]
     RENOMEAR = {"Referente": "Descrição", "R$ Valor Lcto": "Valor Entrada",
                 "R$ Valor Pago": "Valor Recebido"}
     TEXTO = ["Referente", "Dt Vcto"]
-    NUMERICAS = ["R$ Valor Lcto", "R$ Valor Pago", "R$ Total Pago",
-                 "Saldo Devedor", "Saldo Acum."]
+    NUMERICAS = ["R$ Valor Lcto", "R$ Valor Pago", "Saldo Acum."]
 
     if not linhas:
         st.info("Nenhum lançamento para este imóvel.")
+    elif not linhas_periodo:
+        st.info("Nenhum lançamento no período selecionado.")
     elif not modo_edicao:
-        df = pd.DataFrame(linhas)[COLS_EXIBIR].copy()
+        df = pd.DataFrame(linhas_periodo)[COLS_EXIBIR].copy()
         for c in NUMERICAS:
             df[c] = df[c].apply(brl)
         df = df.rename(columns=RENOMEAR)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        larguras = [2.0, 1.0, 1.1, 1.1, 1.1, 1.1, 1.1, 1.6, 0.9]
+        larguras = [3.0, 1.0, 1.1, 1.1, 1.2, 1.8, 0.9]
         titulos = [RENOMEAR.get(c, c) for c in COLS_EXIBIR] + ["Ação"]
         h = st.columns(larguras)
         for col, titulo in zip(h, titulos):
@@ -689,7 +764,7 @@ def pagina_extrato():
 
         alvo = st.session_state.get("ext_confirm")
 
-        for item in linhas:
+        for item in linhas_periodo:
             c = st.columns(larguras)
             for i, campo in enumerate(TEXTO):
                 c[i].write(item[campo])
