@@ -5,11 +5,11 @@ Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
 O app lê/escreve via gspread (conta de serviço). Os cálculos são feitos em
 Python, então a planilha guarda apenas os campos que o usuário digita.
 
-Aba Pagamentos (colunas A..J):
-    Loja | Dt Lcto | Referente | Dt Vcto | Valor Lcto | Valor Pago | Multa | Juros | CM
-    | Observação
+Aba Pagamentos (colunas A..G):
+    Loja | Dt Lcto | Referente | Dt Vcto | Valor Lcto | Valor Pago | Observação
 
-    Total Pago    = Valor Pago + Multa + Juros + CM   (calculado)
+    Total Pago    = Valor Pago                        (multa/juros/CM viram linha
+                                                         própria em Referente+Valor)
     Saldo Devedor = Valor Lcto - Total Pago           (calculado)
 
 Configuração (Streamlit secrets):
@@ -46,9 +46,9 @@ INDICES = ["IGP-M", "IGP-DI", "IPCA", "INCC-DI"]
 MESES_PT = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho",
             "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
 
-# Aba Pagamentos — colunas A..J
+# Aba Pagamentos — colunas A..G
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
-         "Valor Pago", "Multa", "Juros", "CM", "Observação"]
+         "Valor Pago", "Observação"]
 
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
@@ -149,6 +149,14 @@ def excluir_linha(aba: str, linha: int):
     ws(aba).delete_rows(int(linha))
 
 
+def limpar_pagamentos():
+    """Apaga TODOS os lançamentos (aba Pagamentos) de todas as lojas e recria
+    só o cabeçalho. A aba Lojas (imóveis cadastrados) não é tocada."""
+    aba = ws("Pagamentos")
+    aba.clear()
+    aba.update("A1", [H_PAG])
+
+
 # ----------------------------------------------------------------------------- #
 # Utilidades
 # ----------------------------------------------------------------------------- #
@@ -191,8 +199,9 @@ def to_date(v):
 
 
 def total_pago(r) -> float:
-    """Total Pago = Valor Pago + Multa + Juros + CM."""
-    return num(r["Valor Pago"]) + num(r["Multa"]) + num(r["Juros"]) + num(r["CM"])
+    """Total Pago = Valor Pago (multa/juros/correção monetária entram como uma
+    linha própria de Referente+Valor, não como campos separados)."""
+    return num(r["Valor Pago"])
 
 
 def linhas_validas(df: pd.DataFrame) -> list:
@@ -616,13 +625,13 @@ def pagina_lancamentos():
         for i, (desc, valor) in enumerate(entradas_ok):
             vcto = vcto_aluguel.strftime("%d/%m/%Y") if desc.strip().lower() == "aluguel" else ""
             linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, vcto,
-                           valor, 0, 0, 0, 0, obs_entradas if i == 0 else ""])
+                           valor, 0, obs_entradas if i == 0 else ""])
         for i, (desc, valor) in enumerate(recebido_ok):
             linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, "",
-                           0, valor, 0, 0, 0, obs_recebido if i == 0 else ""])
+                           0, valor, obs_recebido if i == 0 else ""])
         if obs_finais.strip():
             linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), f"OBS {escolha}",
-                           "", 0, 0, 0, 0, 0, obs_finais.strip()])
+                           "", 0, 0, obs_finais.strip()])
 
         if not linhas:
             st.warning("Nada para salvar — preencha ao menos uma linha com descrição e valor.")
@@ -687,9 +696,6 @@ def pagina_extrato():
                 "Dt Vcto": r.get("Dt Vcto", "") or "—",
                 "R$ Valor Lcto": lcto,
                 "R$ Valor Pago": num(r["Valor Pago"]),
-                "Multa": num(r["Multa"]),
-                "Juros": num(r["Juros"]),
-                "CM": num(r["CM"]),
                 "R$ Total Pago": tot,
                 "Saldo Devedor": lcto - tot,
                 "Saldo Acum.": acum,
@@ -729,14 +735,11 @@ def pagina_extrato():
                             help="Ative para mostrar o botão de excluir em cada linha. "
                                  "A exclusão remove o registro da planilha.")
 
-    # Colunas guardadas internamente (usadas no cálculo de saldo/total) —
-    # Dt Lcto, Multa, Juros e CM continuam existindo aqui, só não aparecem na tela.
-    COLS = ["Dt Lcto", "Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
-            "Multa", "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum.",
-            "Observação"]
+    # Cada item de `linhas` já traz Dt Lcto/R$ Total Pago/Saldo Devedor (usados no
+    # cálculo do saldo) além das colunas exibidas abaixo.
 
-    # Colunas exibidas: sem Dt Lcto/Multa/Juros/CM/R$ Total Pago/Saldo Devedor,
-    # e com nomes mais claros — "Descrição" com o máximo de espaço possível.
+    # Colunas exibidas: sem Dt Lcto/R$ Total Pago/Saldo Devedor, e com nomes mais
+    # claros — "Descrição" com o máximo de espaço possível.
     COLS_EXIBIR = ["Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
                    "Saldo Acum.", "Observação"]
     RENOMEAR = {"Referente": "Descrição", "R$ Valor Lcto": "Valor Entrada",
@@ -971,6 +974,22 @@ def pagina_imoveis():
                     value_input_option="USER_ENTERED")
                 st.success(f"Loja {novo_id} cadastrada.")
                 st.rerun()
+
+    st.divider()
+    with st.expander("🧹 Limpeza geral — apagar todos os lançamentos"):
+        st.warning(
+            "Isso apaga **todos** os lançamentos (entradas, recebidos e histórico do "
+            "Extrato) de **todas as lojas**. As lojas cadastradas continuam intactas — "
+            "só o histórico de pagamentos é zerado. **Essa ação não pode ser desfeita.**")
+        confirmar_txt = st.text_input(
+            "Para confirmar, digite LIMPAR (tudo em maiúsculas):",
+            key="limpar_pag_confirm")
+        if st.button("🗑️ Apagar todos os lançamentos", type="primary",
+                     disabled=confirmar_txt != "LIMPAR"):
+            limpar_pagamentos()
+            st.session_state.pop("limpar_pag_confirm", None)
+            st.toast("Todos os lançamentos foram apagados. Lojas mantidas.", icon="🧹")
+            st.rerun()
 
 
 # ----------------------------------------------------------------------------- #
