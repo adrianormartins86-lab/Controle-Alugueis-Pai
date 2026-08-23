@@ -265,7 +265,7 @@ def gerar_pdf_demonstrativo(loja_nome, mes_label, contrato_info, saldo_ant,
     tabela("Recebido no mês", recebido, tot_recebido, obs_recebido)
 
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 10, pdf_seguro(f"Valor transferido para o mês seguinte: {brl(pendente)}"),
+    pdf.cell(0, 10, pdf_seguro(f"Pendente transferido pro mês seguinte: {brl(pendente)}"),
              **ROW_END)
     if obs_finais:
         pdf.set_font("Helvetica", "I", 10)
@@ -476,7 +476,8 @@ def pagina_lancamentos():
         column_config={
             "Descrição": st.column_config.TextColumn("Descrição", width="large"),
             "Valor": st.column_config.NumberColumn("R$ Valor", format="%.2f",
-                                                    min_value=0.0, step=0.01),
+                                                    min_value=0.0, step=0.01,
+                                                    width="small"),
         })
     tot_entradas = float(pd.to_numeric(entradas_df.get("Valor"), errors="coerce")
                          .fillna(0).sum()) if not entradas_df.empty else 0.0
@@ -495,7 +496,8 @@ def pagina_lancamentos():
         column_config={
             "Descrição": st.column_config.TextColumn("Descrição", width="large"),
             "Valor": st.column_config.NumberColumn("R$ Valor", format="%.2f",
-                                                    min_value=0.0, step=0.01),
+                                                    min_value=0.0, step=0.01,
+                                                    width="small"),
         })
     tot_recebido = float(pd.to_numeric(recebido_df.get("Valor"), errors="coerce")
                          .fillna(0).sum()) if not recebido_df.empty else 0.0
