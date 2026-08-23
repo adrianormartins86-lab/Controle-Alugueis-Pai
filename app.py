@@ -26,6 +26,7 @@ import datetime as dt
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -213,11 +214,41 @@ def saldo_loja(loja_id, lojas: pd.DataFrame, pags: pd.DataFrame) -> float:
 # ----------------------------------------------------------------------------- #
 # Login
 # ----------------------------------------------------------------------------- #
+def sem_gerenciador_de_senha():
+    """Evita que o navegador ofereça salvar/gerar senha no campo de login.
+
+    Streamlit não expõe o atributo HTML `autocomplete` do campo de senha, então
+    isso é feito via um componente invisível que ajusta o input real (que vive
+    na página-pai, fora do iframe do componente) depois que ele é renderizado.
+    Reutilizável em qualquer app: chame antes do primeiro `text_input` de senha.
+    """
+    components.html(
+        """
+        <script>
+        function ajustar() {
+            const doc = window.parent.document;
+            doc.querySelectorAll('input[type="password"]').forEach(el => {
+                el.setAttribute('autocomplete', 'current-password');
+                el.setAttribute('data-lpignore', 'true');   // LastPass
+                el.setAttribute('data-1p-ignore', 'true');  // 1Password
+                el.setAttribute('data-bwignore', 'true');   // Bitwarden
+            });
+        }
+        ajustar();
+        new MutationObserver(ajustar).observe(window.parent.document.body,
+            {childList: true, subtree: true});
+        </script>
+        """,
+        height=0,
+    )
+
+
 def checar_senha() -> bool:
     senha = st.secrets.get("app_password", "1234")
     if st.session_state.get("ok"):
         return True
     st.markdown("### 🔐 Gestão de Aluguéis")
+    sem_gerenciador_de_senha()
     pwd = st.text_input("Senha", type="password")
     if st.button("Entrar", type="primary"):
         if pwd == senha:
