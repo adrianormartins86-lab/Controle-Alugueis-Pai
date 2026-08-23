@@ -734,26 +734,64 @@ def pagina_imoveis():
 # ----------------------------------------------------------------------------- #
 # App
 # ----------------------------------------------------------------------------- #
+SIDEBAR_CSS = """
+<style>
+[data-testid="stSidebar"] {
+    background-color: #0B2545;
+}
+[data-testid="stSidebar"] * {
+    color: #FFFFFF !important;
+}
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+    color: #FFFFFF !important;
+}
+[data-testid="stSidebar"] .stButton>button {
+    background-color: #13315C;
+    color: #FFFFFF !important;
+    border: 1px solid #2C4A7C;
+}
+[data-testid="stSidebar"] .stButton>button:hover {
+    background-color: #1C4278;
+    border-color: #E5007D;
+}
+[data-testid="stSidebar"] hr {
+    border-color: rgba(255,255,255,0.25);
+}
+</style>
+"""
+
+# (ícone, rótulo, função da página)
+PAGINAS = [
+    ("📊", "Painel", pagina_painel),
+    ("🧾", "Lançamentos", pagina_lancamentos),
+    ("📄", "Extrato", pagina_extrato),
+    ("📈", "Reajustes", pagina_reajustes),
+    ("🏠", "Imóveis", pagina_imoveis),
+]
+
+
 def main():
     st.set_page_config(page_title="Gestão de Aluguéis", page_icon="🏠", layout="wide")
+    st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
     if not checar_senha():
         return
 
     st.sidebar.title("🏠 Gestão de Aluguéis")
-    pag = st.sidebar.radio("Menu", ["Painel", "Lançamentos", "Extrato",
-                                    "Reajustes", "Imóveis"])
+    rotulos = [f"{icone}  {nome}" for icone, nome, _ in PAGINAS]
+    escolha = st.sidebar.radio("Menu", rotulos, label_visibility="collapsed")
+    pag = dict(zip(rotulos, [nome for _, nome, _ in PAGINAS]))[escolha]
+    funcoes = {nome: fn for _, nome, fn in PAGINAS}
+
     st.sidebar.divider()
     if st.sidebar.button("🔄 Recarregar dados"):
         st.cache_resource.clear()
         st.rerun()
-    if st.sidebar.button("Sair"):
+    if st.sidebar.button("🚪 Sair"):
         st.session_state["ok"] = False
         st.rerun()
 
     try:
-        {"Painel": pagina_painel, "Lançamentos": pagina_lancamentos,
-         "Extrato": pagina_extrato, "Reajustes": pagina_reajustes,
-         "Imóveis": pagina_imoveis}[pag]()
+        funcoes[pag]()
     except Exception as e:
         st.error(f"Erro ao acessar a planilha: {e}")
         st.caption("Verifique se a planilha foi compartilhada com o e-mail da conta "
