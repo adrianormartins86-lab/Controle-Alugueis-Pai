@@ -655,24 +655,35 @@ def pagina_extrato():
                             help="Ative para mostrar o botão de excluir em cada linha. "
                                  "A exclusão remove o registro da planilha.")
 
+    # Colunas guardadas internamente (usadas no cálculo de saldo/total) —
+    # Dt Lcto, Multa, Juros e CM continuam existindo aqui, só não aparecem na tela.
     COLS = ["Dt Lcto", "Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
             "Multa", "Juros", "CM", "R$ Total Pago", "Saldo Devedor", "Saldo Acum.",
             "Observação"]
-    TEXTO = COLS[:3]          # Dt Lcto, Referente, Dt Vcto
-    NUMERICAS = COLS[3:11]    # todas em R$
-    FINAL_TEXTO = ["Observação"]
+
+    # Colunas exibidas: sem Dt Lcto/Multa/Juros/CM, e com nomes mais claros
+    # para o "Referente" ganhar mais espaço na tela.
+    COLS_EXIBIR = ["Referente", "Dt Vcto", "R$ Valor Lcto", "R$ Valor Pago",
+                   "R$ Total Pago", "Saldo Devedor", "Saldo Acum.", "Observação"]
+    RENOMEAR = {"Referente": "Descrição", "R$ Valor Lcto": "Valor Entrada",
+                "R$ Valor Pago": "Valor Recebido"}
+    TEXTO = ["Referente", "Dt Vcto"]
+    NUMERICAS = ["R$ Valor Lcto", "R$ Valor Pago", "R$ Total Pago",
+                 "Saldo Devedor", "Saldo Acum."]
 
     if not linhas:
         st.info("Nenhum lançamento para este imóvel.")
     elif not modo_edicao:
-        df = pd.DataFrame(linhas)[COLS].copy()
+        df = pd.DataFrame(linhas)[COLS_EXIBIR].copy()
         for c in NUMERICAS:
             df[c] = df[c].apply(brl)
+        df = df.rename(columns=RENOMEAR)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        larguras = [1.0, 1.3, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.3, 0.9]
+        larguras = [2.0, 1.0, 1.1, 1.1, 1.1, 1.1, 1.1, 1.6, 0.9]
+        titulos = [RENOMEAR.get(c, c) for c in COLS_EXIBIR] + ["Ação"]
         h = st.columns(larguras)
-        for col, titulo in zip(h, COLS + ["Ação"]):
+        for col, titulo in zip(h, titulos):
             col.markdown(f"<small><b>{titulo}</b></small>", unsafe_allow_html=True)
         st.markdown("<hr style='margin:2px 0 8px 0'>", unsafe_allow_html=True)
 
@@ -688,7 +699,7 @@ def pagina_extrato():
             c[len(TEXTO) + len(NUMERICAS)].write(item["Observação"] or "—")
 
             linha_planilha = item["__linha"]
-            acao = c[len(COLS)]
+            acao = c[len(COLS_EXIBIR)]
             if alvo == linha_planilha:
                 b1, b2 = acao.columns(2)
                 if b1.button("✅", key=f"ok{linha_planilha}", help="Confirmar exclusão"):
