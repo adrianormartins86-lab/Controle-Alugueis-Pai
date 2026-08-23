@@ -386,7 +386,9 @@ def pagina_lancamentos():
     st.markdown(f"**Entradas** · aluguel do mês vence em {vcto_aluguel.strftime('%d/%m/%Y')}")
     st.caption("Escreva livremente cada cobrança do mês (Aluguel, IPTU, condomínio, "
                "multa, acordo...) e o valor. Adicione ou apague linhas como numa planilha.")
-    entradas_ini = pd.DataFrame([{"Descrição": "Aluguel", "Valor": num(loja_row["Aluguel Atual"])}])
+    entradas_ini = pd.DataFrame(
+        [{"Descrição": "Aluguel", "Valor": num(loja_row["Aluguel Atual"])}]
+        + [{"Descrição": "", "Valor": 0.0} for _ in range(3)])
     entradas_df = st.data_editor(
         entradas_ini, num_rows="dynamic", use_container_width=True, hide_index=True,
         key=f"ent_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}",
@@ -403,7 +405,9 @@ def pagina_lancamentos():
 
     st.divider()
     st.markdown("**Recebido no mês** · valor total ou parcial")
-    recebido_ini = pd.DataFrame([{"Descrição": "Aluguel", "Valor": 0.0}])
+    recebido_ini = pd.DataFrame(
+        [{"Descrição": "Aluguel", "Valor": 0.0}]
+        + [{"Descrição": "", "Valor": 0.0} for _ in range(3)])
     recebido_df = st.data_editor(
         recebido_ini, num_rows="dynamic", use_container_width=True, hide_index=True,
         key=f"rec_{loja_id}_{ano_ref}_{mes_ref}_{reset_key}",
