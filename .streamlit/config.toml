@@ -5,6 +5,7 @@ secondaryBackgroundColor = "#F2F6FA"
 textColor = "#0B3D63"
 font = "sans serif"
 dataframeHeaderBackgroundColor = "#AFC6E8"
- 
+baseFontWeight = 600
+
 [client]
 toolbarMode = "minimal"
