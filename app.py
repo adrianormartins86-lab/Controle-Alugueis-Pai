@@ -540,8 +540,29 @@ LANCAMENTOS_CSS = """
 """
 
 
+@st.dialog("Confirmar Demonstrativo")
+def _dialog_confirmar_lancamento(loja_id, nome_loja, escolha, ano_ref, mes_ref,
+                                  registros, tot_entradas, tot_recebido, reset_key):
+    st.write(f"Salvar o demonstrativo de **{escolha}** para **{nome_loja}**?")
+    st.write(f"Entradas: **{brl(tot_entradas)}** · Recebido: **{brl(tot_recebido)}**")
+    st.caption(f"{len(registros)} lançamento(s) serão gravados.")
+    c1, c2 = st.columns(2)
+    if c1.button("✅ Confirmar e salvar", type="primary", use_container_width=True):
+        _com_retentativa(
+            lambda: get_client().table("alugueis_pagamentos").insert(registros).execute())
+        invalidar_cache_planilha()
+        st.session_state[f"lc_reset_{loja_id}_{ano_ref}_{mes_ref}"] = reset_key + 1
+        st.session_state["_lc_msg_sucesso"] = (
+            f"Demonstrativo de {escolha} salvo — {len(registros)} lançamento(s) gravado(s).")
+        st.rerun()
+    if c2.button("↩️ Cancelar", use_container_width=True):
+        st.rerun()
+
+
 def pagina_lancamentos():
     st.subheader("🧾 Lançamentos — Demonstrativo Mensal")
+    if "_lc_msg_sucesso" in st.session_state:
+        st.success(st.session_state.pop("_lc_msg_sucesso"))
     # Negrito nessa página a pedido do usuário (cliente com dificuldade de
     # visão). O peso da fonte "de fábrica" do app já subiu no config.toml
     # (baseFontWeight) — isso é global, o Streamlit não permite por página —
@@ -699,12 +720,8 @@ def pagina_lancamentos():
         if not registros:
             st.warning("Nada para salvar — preencha ao menos uma linha com descrição e valor.")
         else:
-            _com_retentativa(
-                lambda: get_client().table("alugueis_pagamentos").insert(registros).execute())
-            invalidar_cache_planilha()
-            st.session_state[f"lc_reset_{loja_id}_{ano_ref}_{mes_ref}"] = reset_key + 1
-            st.success(f"Demonstrativo de {escolha} salvo — {len(linhas)} linha(s) gravada(s).")
-            st.rerun()
+            _dialog_confirmar_lancamento(loja_id, sel, escolha, ano_ref, mes_ref,
+                                          registros, tot_entradas, tot_recebido, reset_key)
 
     # --- o que já está lançado neste mês ---
     st.divider()
