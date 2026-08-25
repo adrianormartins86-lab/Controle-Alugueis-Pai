@@ -53,9 +53,24 @@ H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 # ----------------------------------------------------------------------------- #
 # Conexão com o Supabase
 # ----------------------------------------------------------------------------- #
+def _get_secret(*nomes):
+    """Procura a chave nos secrets do Streamlit tentando cada nome da lista —
+    aceita tanto 'supabase_url' (minúsculo) quanto 'SUPABASE_URL' (maiúsculo),
+    já que o TOML dos secrets é case-sensitive e cada um escreve diferente."""
+    for n in nomes:
+        if n in st.secrets:
+            return st.secrets[n]
+    raise KeyError(
+        "Nenhuma dessas chaves foi encontrada nos secrets do Streamlit: "
+        + ", ".join(nomes))
+
+
 @st.cache_resource
 def get_client():
-    return create_client(st.secrets["supabase_url"], st.secrets["supabase_key"])
+    url = _get_secret("supabase_url", "SUPABASE_URL", "Supabase_Url")
+    key = _get_secret("supabase_key", "SUPABASE_KEY", "SUPABASE_SERVICE_KEY",
+                       "SUPABASE_SERVICE_ROLE_KEY", "supabase_service_key")
+    return create_client(url, key)
 
 
 # Nome "de planilha" -> tabela/colunas reais no Postgres.
