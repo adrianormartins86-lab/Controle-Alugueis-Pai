@@ -1,11 +1,13 @@
 """
-Gestão de Aluguéis — versão com Google Sheets como banco de dados.
+Gestão de Aluguéis — versão com Supabase (Postgres) como banco de dados.
 
-Backend: uma planilha Google com 3 abas (Lojas, Pagamentos, Reajustes).
-O app lê/escreve via gspread (conta de serviço). Os cálculos são feitos em
-Python, então a planilha guarda apenas os campos que o usuário digita.
+Backend: projeto Supabase "Diversos", 3 tabelas (alugueis_lojas,
+alugueis_pagamentos, alugueis_reajustes — ver schema_alugueis.sql). O app
+lê/escreve via supabase-py, usando a service_role key (mantida só nos
+secrets do Streamlit, nunca chega ao navegador). Os cálculos continuam
+feitos em Python — o banco guarda só os campos que o usuário digita.
 
-Aba Pagamentos (colunas A..G):
+Registro de Pagamentos:
     Loja | Dt Lcto | Referente | Dt Vcto | Valor Lcto | Valor Pago | Observação
 
     Total Pago    = Valor Pago                        (multa/juros/CM viram linha
@@ -13,148 +15,188 @@ Aba Pagamentos (colunas A..G):
     Saldo Devedor = Valor Lcto - Total Pago           (calculado)
 
 Configuração (Streamlit secrets):
-    app_password = "sua_senha"
-    sheet_key    = "ID_DA_PLANILHA"
-    [gcp_service_account]
-    type = "service_account"
-    ...
+    app_password  = "sua_senha"
+    supabase_url  = "https://xxxxxxxx.supabase.co"
+    supabase_key  = "eyJ..."   # service_role key (Project Settings → API)
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import time
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-import gspread
 from fpdf import FPDF, XPos, YPos
-from google.oauth2.service_account import Credentials
+from supabase import create_client
 
 # ----------------------------------------------------------------------------- #
-# Estrutura das abas
+# Estrutura dos dados (nomes "de planilha" usados no resto do app — a camada
+# de acesso ao Supabase abaixo converte de/para os nomes de coluna do banco)
 # ----------------------------------------------------------------------------- #
-# Aba Lojas — colunas A..L
 H_LOJAS = ["Loja", "Responsável", "Aluguel Atual", "Dia Vcto", "Dia Pgto",
            "Assinatura Contrato", "Débito Geral", "Caução", "Índice Reajuste",
            "Vencimento Contrato", "Observação", "Próximo Reajuste"]
-# "Próximo Reajuste" foi acrescentada no FIM de propósito: assim as colunas já
-# existentes na planilha do cliente (A..K) não mudam de posição/sentido.
 
 INDICES = ["IGP-M", "IGP-DI", "IPCA", "INCC-DI"]
 
 MESES_PT = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho",
             "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
 
-# Aba Pagamentos — colunas A..G
 H_PAG = ["Loja", "Dt Lcto", "Referente", "Dt Vcto", "Valor Lcto",
          "Valor Pago", "Observação"]
 
 H_REAJ = ["Loja", "Data", "Índice", "%", "Valor Anterior", "Valor Novo"]
 
-LOJAS_SEED = [
-    [1, "Produtos Naturais -- Wilson Oliveira", 1100.00, 25, "", "", -4019.42, 0, "IGP-M",
-     "25/06/2026", "Saldo devedor: (-4.019,42) em 30/06/2026.", ""],
-    [2, "Estética Facial — Lorena Dias de Andrade", 1100.00, 25, "", "", 0, 0, "IGP-M",
-     "25/05/2027", "Sala relocada em 25/04/2026 (antes: Bruna).", ""],
-    [3, "Barbearia — Douglas Vieira Alves", 980.00, 1, "", "", 1232.00, 0, "IGP-M",
-     "01/08/2026", "Refazer contrato 01/08/2026.", ""],
-    [4, "D2 - Espetaria - Everton Argos Leão", 1270.30, 10, "", "", 0, 0, "INCC-DI",
-     "10/05/2027", "Reajuste INCC 5,86% em 10/05/2026.", ""],
-    [5, "Pizzaria KASS — Jair Berbert de Souza", 2126.50, 30, "", "", 0, 0, "IGP-M",
-     "", "Pagamentos em dia.", ""],
-    [6, "Sala projetada (vaga)", 0, 1, "", "", 0, 0, "", "", "", ""],
-]
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
-
 
 # ----------------------------------------------------------------------------- #
-# Conexão com o Google Sheets
+# Conexão com o Supabase
 # ----------------------------------------------------------------------------- #
 @st.cache_resource
-def get_spreadsheet():
-    creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(st.secrets["sheet_key"])
-    garantir_estrutura(sh)
-    return sh
+def get_client():
+    return create_client(st.secrets["supabase_url"], st.secrets["supabase_key"])
 
 
-def garantir_estrutura(sh):
-    """Cria as abas e cabeçalhos que faltarem; cadastra os 6 imóveis se vazio."""
-    titulos = {ws.title: ws for ws in sh.worksheets()}
+# Nome "de planilha" -> tabela/colunas reais no Postgres.
+TABELAS = {"Lojas": "alugueis_lojas", "Pagamentos": "alugueis_pagamentos",
+           "Reajustes": "alugueis_reajustes"}
 
-    def garante(nome, header, ncols):
-        if nome in titulos:
-            ws = titulos[nome]
-        else:
-            ws = sh.add_worksheet(title=nome, rows=500, cols=ncols)
-        atual = ws.row_values(1)
-        if atual[:len(header)] != header:
-            ws.update("A1", [header])
-        return ws
+PK_COL = {"Lojas": "loja", "Pagamentos": "id", "Reajustes": "id"}
 
-    ws_lojas = garante("Lojas", H_LOJAS, len(H_LOJAS))
-    garante("Pagamentos", H_PAG, len(H_PAG))
-    garante("Reajustes", H_REAJ, len(H_REAJ))
+COLMAP = {
+    "Lojas": {
+        "loja": "Loja", "responsavel": "Responsável", "aluguel_atual": "Aluguel Atual",
+        "dia_vcto": "Dia Vcto", "dia_pgto": "Dia Pgto",
+        "assinatura_contrato": "Assinatura Contrato", "debito_geral": "Débito Geral",
+        "caucao": "Caução", "indice_reajuste": "Índice Reajuste",
+        "vencimento_contrato": "Vencimento Contrato", "observacao": "Observação",
+        "proximo_reajuste": "Próximo Reajuste",
+    },
+    "Pagamentos": {
+        "loja": "Loja", "dt_lcto": "Dt Lcto", "referente": "Referente",
+        "dt_vcto": "Dt Vcto", "valor_lcto": "Valor Lcto", "valor_pago": "Valor Pago",
+        "observacao": "Observação",
+    },
+    "Reajustes": {
+        "loja": "Loja", "data": "Data", "indice": "Índice", "percentual": "%",
+        "valor_anterior": "Valor Anterior", "valor_novo": "Valor Novo",
+    },
+}
 
-    if len(ws_lojas.get_all_values()) <= 1:
-        ws_lojas.update("A2", LOJAS_SEED, value_input_option="USER_ENTERED")
+DATE_COLS = {
+    "Lojas": {"Assinatura Contrato", "Vencimento Contrato", "Próximo Reajuste"},
+    "Pagamentos": {"Dt Lcto", "Dt Vcto"},
+    "Reajustes": {"Data"},
+}
+
+ORDER_COL = {"Lojas": "loja", "Pagamentos": "dt_lcto", "Reajustes": "data"}
 
 
-def ws(nome):
-    return get_spreadsheet().worksheet(nome)
+def _com_retentativa(func, *args, tentativas: int = 3, espera_inicial: float = 1.5, **kwargs):
+    """Executa uma chamada ao Supabase tentando de novo (com espera
+    crescente) se der um erro passageiro de rede/conexão — evita que uma
+    instabilidade momentânea derrube a página."""
+    espera = espera_inicial
+    for tentativa in range(tentativas):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            if tentativa < tentativas - 1:
+                time.sleep(espera)
+                espera *= 2
+                continue
+            raise
+
+
+def _fmt_data(v) -> str:
+    """Valor de data vindo do Supabase (string "AAAA-MM-DD" ou None) -> texto
+    "dd/mm/aaaa" (ou "") — mesmo formato que o resto do app espera, herdado
+    da época da planilha."""
+    if not v:
+        return ""
+    if isinstance(v, (dt.date, dt.datetime)):
+        return v.strftime("%d/%m/%Y")
+    try:
+        return dt.datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return str(v)
+
+
+def _parse_data_br(txt) -> str | None:
+    """Texto "dd/mm/aaaa" digitado pelo usuário -> "aaaa-mm-dd" para gravar
+    no Postgres, ou None se vazio/inválido."""
+    txt = (txt or "").strip()
+    if not txt:
+        return None
+    d = pd.to_datetime(txt, dayfirst=True, errors="coerce")
+    return None if pd.isna(d) else d.date().isoformat()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _valores_aba(nome: str):
+    """Lê a tabela inteira do Supabase e guarda em cache por alguns segundos
+    — assim várias chamadas a ler() no mesmo carregamento de página (ou em
+    reruns seguidos) não geram uma requisição nova para cada uma."""
+    tabela = TABELAS[nome]
+    ordem = ORDER_COL[nome]
+
+    def _fetch():
+        q = get_client().table(tabela).select("*").order(ordem)
+        if nome != "Lojas":
+            q = q.order("id")   # desempate estável quando a data repete
+        return q.execute().data
+
+    return _com_retentativa(_fetch)
+
+
+def invalidar_cache_planilha():
+    """Chamar sempre depois de qualquer escrita (excluir, salvar, editar) —
+    limpa o cache de leitura para a página já recarregar com o dado novo."""
+    _valores_aba.clear()
 
 
 def ler(nome, headers, com_linha: bool = False) -> pd.DataFrame:
-    """Lê a aba pegando só as colunas conhecidas (pela 1ª ocorrência do nome).
+    """Lê a tabela e devolve um DataFrame com os mesmos nomes de coluna "de
+    planilha" que o resto do app usa (H_LOJAS/H_PAG/H_REAJ).
 
-    Se com_linha=True, devolve também '__linha' com o número REAL da linha na
-    planilha (usada para excluir registros com segurança).
+    Se com_linha=True, devolve também '__linha' com o id real do registro no
+    banco (usado para excluir/editar com segurança).
     """
-    vals = ws(nome).get_all_values()
-    if not vals:
-        cols = list(headers) + (["__linha"] if com_linha else [])
-        return pd.DataFrame(columns=cols)
+    registros = _valores_aba(nome)
+    colmap = COLMAP[nome]
+    datecols = DATE_COLS[nome]
 
-    head = vals[0]
-    width = len(head)
+    linhas = []
+    for reg in registros:
+        linha = {}
+        for col_db, col_sheet in colmap.items():
+            v = reg.get(col_db)
+            if col_sheet in datecols:
+                v = _fmt_data(v)
+            elif v is None:
+                v = ""
+            linha[col_sheet] = v
+        if com_linha:
+            linha["__linha"] = reg.get("id")
+        linhas.append(linha)
 
-    linhas, numeros = [], []
-    for i, r in enumerate(vals[1:], start=2):   # linha 1 = cabeçalho
-        linhas.append(list(r)[:width] + [""] * (width - len(r)))
-        numeros.append(i)
-
-    base = pd.DataFrame(linhas, columns=[f"__c{i}" for i in range(width)])
-
-    out = {}
-    for h in headers:
-        out[h] = base[f"__c{head.index(h)}"] if h in head else ""
-    df = pd.DataFrame(out, index=base.index)
-    df["__linha"] = numeros
-
-    if headers and headers[0] in df.columns and not df.empty:
-        df = df[df[headers[0]].astype(str).str.strip() != ""]
-
-    df = df.reset_index(drop=True)
-    if not com_linha:
-        df = df.drop(columns=["__linha"])
-    return df
+    cols = list(headers) + (["__linha"] if com_linha else [])
+    return pd.DataFrame(linhas, columns=cols)
 
 
-def excluir_linha(aba: str, linha: int):
-    ws(aba).delete_rows(int(linha))
+def excluir_linha(aba: str, chave):
+    tabela, pk = TABELAS[aba], PK_COL[aba]
+    _com_retentativa(lambda: get_client().table(tabela).delete().eq(pk, chave).execute())
+    invalidar_cache_planilha()
 
 
 def limpar_pagamentos():
-    """Apaga TODOS os lançamentos (aba Pagamentos) de todas as lojas e recria
-    só o cabeçalho. A aba Lojas (imóveis cadastrados) não é tocada."""
-    aba = ws("Pagamentos")
-    aba.clear()
-    aba.update("A1", [H_PAG])
+    """Apaga TODOS os lançamentos (tabela alugueis_pagamentos) de todas as
+    lojas. A tabela de imóveis não é tocada."""
+    _com_retentativa(
+        lambda: get_client().table("alugueis_pagamentos").delete().gte("id", 0).execute())
+    invalidar_cache_planilha()
 
 
 # ----------------------------------------------------------------------------- #
@@ -621,22 +663,30 @@ def pagina_lancamentos():
 
     if salvar:
         dt_lcto = hoje if (ano_ref, mes_ref) == (hoje.year, hoje.month) else ini_mes
-        linhas = []
+        registros = []
         for i, (desc, valor) in enumerate(entradas_ok):
-            vcto = vcto_aluguel.strftime("%d/%m/%Y") if desc.strip().lower() == "aluguel" else ""
-            linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, vcto,
-                           valor, 0, obs_entradas if i == 0 else ""])
+            vcto = vcto_aluguel.isoformat() if desc.strip().lower() == "aluguel" else None
+            registros.append({"loja": int(loja_id), "dt_lcto": dt_lcto.isoformat(),
+                               "referente": desc, "dt_vcto": vcto,
+                               "valor_lcto": valor, "valor_pago": 0,
+                               "observacao": obs_entradas if i == 0 else ""})
         for i, (desc, valor) in enumerate(recebido_ok):
-            linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), desc, "",
-                           0, valor, obs_recebido if i == 0 else ""])
+            registros.append({"loja": int(loja_id), "dt_lcto": dt_lcto.isoformat(),
+                               "referente": desc, "dt_vcto": None,
+                               "valor_lcto": 0, "valor_pago": valor,
+                               "observacao": obs_recebido if i == 0 else ""})
         if obs_finais.strip():
-            linhas.append([loja_id, dt_lcto.strftime("%d/%m/%Y"), f"OBS {escolha}",
-                           "", 0, 0, obs_finais.strip()])
+            registros.append({"loja": int(loja_id), "dt_lcto": dt_lcto.isoformat(),
+                               "referente": f"OBS {escolha}", "dt_vcto": None,
+                               "valor_lcto": 0, "valor_pago": 0,
+                               "observacao": obs_finais.strip()})
 
-        if not linhas:
+        if not registros:
             st.warning("Nada para salvar — preencha ao menos uma linha com descrição e valor.")
         else:
-            ws("Pagamentos").append_rows(linhas, value_input_option="USER_ENTERED")
+            _com_retentativa(
+                lambda: get_client().table("alugueis_pagamentos").insert(registros).execute())
+            invalidar_cache_planilha()
             st.session_state[f"lc_reset_{loja_id}_{ano_ref}_{mes_ref}"] = reset_key + 1
             st.success(f"Demonstrativo de {escolha} salvo — {len(linhas)} linha(s) gravada(s).")
             st.rerun()
@@ -835,12 +885,14 @@ def pagina_reajustes():
             if perc == 0:
                 st.warning("Informe um percentual.")
             else:
-                ws("Reajustes").append_row(
-                    [op[sel], data.strftime("%d/%m/%Y"), indice, perc, atual, novo],
-                    value_input_option="USER_ENTERED")
-                wl = ws("Lojas")
-                cell = wl.find(str(op[sel]), in_column=1)
-                wl.update_cell(cell.row, 3, novo)   # coluna C = Aluguel Atual
+                _com_retentativa(lambda: get_client().table("alugueis_reajustes").insert({
+                    "loja": int(op[sel]), "data": data.isoformat(), "indice": indice,
+                    "percentual": perc, "valor_anterior": atual, "valor_novo": novo,
+                }).execute())
+                _com_retentativa(lambda: get_client().table("alugueis_lojas")
+                                  .update({"aluguel_atual": novo}).eq("loja", int(op[sel]))
+                                  .execute())
+                invalidar_cache_planilha()
                 st.success(f"Reajuste aplicado: {brl(atual)} → {brl(novo)}.")
                 st.rerun()
 
@@ -924,16 +976,17 @@ def pagina_imoveis():
                 obs = st.text_area("Observação", value=str(r.get("Observação", "")))
 
                 if st.form_submit_button("💾 Salvar", type="primary"):
-                    wl = ws("Lojas")
-                    cell = wl.find(str(r["Loja"]), in_column=1)
-                    # B..L = Responsável, Aluguel Atual, Dia Vcto, Dia Pgto,
-                    #        Assinatura Contrato, Débito Geral, Caução, Índice Reajuste,
-                    #        Vencimento Contrato, Observação, Próximo Reajuste
-                    wl.update(f"B{cell.row}:L{cell.row}",
-                              [[resp, aluguel, dia_vcto, dia_pgto, assinatura,
-                                debito, calcao, ", ".join(indices_sel),
-                                venc_contr, obs, prox_reaj]],
-                              value_input_option="USER_ENTERED")
+                    _com_retentativa(lambda: get_client().table("alugueis_lojas").update({
+                        "responsavel": resp, "aluguel_atual": aluguel,
+                        "dia_vcto": dia_vcto, "dia_pgto": dia_pgto,
+                        "assinatura_contrato": _parse_data_br(assinatura),
+                        "debito_geral": debito, "caucao": calcao,
+                        "indice_reajuste": ", ".join(indices_sel),
+                        "vencimento_contrato": _parse_data_br(venc_contr),
+                        "observacao": obs,
+                        "proximo_reajuste": _parse_data_br(prox_reaj),
+                    }).eq("loja", int(r["Loja"])).execute())
+                    invalidar_cache_planilha()
                     st.success("Atualizado.")
                     st.rerun()
 
@@ -945,9 +998,7 @@ def pagina_imoveis():
                 b1, b2 = st.columns(2)
                 if b1.button("✅ Confirmar exclusão", key=f"delok{r['Loja']}",
                              type="primary"):
-                    wl = ws("Lojas")
-                    cell = wl.find(str(r["Loja"]), in_column=1)
-                    excluir_linha("Lojas", cell.row)
+                    excluir_linha("Lojas", int(r["Loja"]))
                     st.session_state.pop("im_confirm_excluir", None)
                     st.toast("Imóvel excluído.", icon="🗑️")
                     st.rerun()
@@ -969,9 +1020,14 @@ def pagina_imoveis():
                                       format="%.2f")
             dia_vcto = st.number_input("Dia Vcto", min_value=1, max_value=31, value=1)
             if st.form_submit_button("💾 Cadastrar", type="primary"):
-                ws("Lojas").append_row(
-                    [novo_id, resp, aluguel, dia_vcto, "", "", 0, 0, "", "", "", ""],
-                    value_input_option="USER_ENTERED")
+                _com_retentativa(lambda: get_client().table("alugueis_lojas").insert({
+                    "loja": novo_id, "responsavel": resp, "aluguel_atual": aluguel,
+                    "dia_vcto": dia_vcto, "dia_pgto": None, "assinatura_contrato": None,
+                    "debito_geral": 0, "caucao": 0, "indice_reajuste": "",
+                    "vencimento_contrato": None, "observacao": "",
+                    "proximo_reajuste": None,
+                }).execute())
+                invalidar_cache_planilha()
                 st.success(f"Loja {novo_id} cadastrada.")
                 st.rerun()
 
@@ -1046,6 +1102,7 @@ def main():
     st.sidebar.divider()
     if st.sidebar.button("🔄 Recarregar dados"):
         st.cache_resource.clear()
+        invalidar_cache_planilha()
         st.rerun()
     if st.sidebar.button("🚪 Sair"):
         st.session_state["ok"] = False
@@ -1054,9 +1111,11 @@ def main():
     try:
         funcoes[pag]()
     except Exception as e:
-        st.error(f"Erro ao acessar a planilha: {e}")
-        st.caption("Verifique se a planilha foi compartilhada com o e-mail da conta "
-                   "de serviço (client_email) e se o sheet_key está correto.")
+        st.error(f"Erro ao acessar o banco de dados: {e}")
+        st.caption("Verifique se 'supabase_url' e 'supabase_key' (a service_role key) "
+                   "estão certos nos secrets do Streamlit, e se as tabelas "
+                   "alugueis_lojas / alugueis_pagamentos / alugueis_reajustes existem "
+                   "no projeto Supabase.")
 
 
 if __name__ == "__main__":
